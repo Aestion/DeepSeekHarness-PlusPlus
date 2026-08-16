@@ -1,4 +1,4 @@
-# 压缩便携发布目录（排除 .portable 运行数据）。
+﻿# 压缩便携发布目录（排除 .portable 运行数据）。
 # 格式：auto（有 7-Zip 用 .7z 高压缩，否则 .zip）| zip | 7z
 param(
     [ValidateSet('auto', 'zip', '7z')][string]$Format = 'auto',

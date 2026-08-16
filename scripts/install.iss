@@ -1,8 +1,8 @@
-; DSHPlusPlus 安装器（Inno Setup 6）。
-; 用法：ISCC.exe /dSourceDir=<发布目录> scripts\install.iss
-; 示例：ISCC.exe /dSourceDir=release\DSHPlusPlus-0.1.0-dev.1-windows-x64 scripts\install.iss
-; 设计：便携目录安装到 {app}；用户数据通过 DSHPLUSPLUS_DATA_ROOT 环境变量
-; 落到 %LOCALAPPDATA%\DSHPlusPlus（Program Files 目录不可写，数据必须外置）。
+; DSHPlusPlus installer (Inno Setup 6).
+; Usage: ISCC.exe /dSourceDir=<stage-dir> scripts\install.iss
+; The stage dir is the assembled portable directory (DSHPlusPlus-<version>-windows-x64).
+; User data is redirected via the DSHPLUSPLUS_DATA_ROOT environment variable to
+; %LOCALAPPDATA%\DSHPlusPlus (Program Files is not writable; data must live outside).
 
 #ifndef SourceDir
   #define SourceDir "..\release"
@@ -39,11 +39,12 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-; 便携目录全部内容（排除运行数据 .portable 与历史备份）
+; All contents of the stage dir (runtime data .portable, backups and staged
+; updates are excluded).
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: ".portable,*.bak-*,*.update.exe"
 
 [Registry]
-; 用户数据外置：数据根目录指向 %LOCALAPPDATA%\DSHPlusPlus（per-user）
+; Per-user data root outside Program Files.
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "DSHPLUSPLUS_DATA_ROOT"; ValueData: "{localappdata}\DSHPlusPlus"; Flags: preservestringtype
 
 [Icons]
@@ -57,4 +58,4 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 Type: filesandordirs; Name: "{app}"
 
 [Code]
-{ 卸载时提示保留用户数据（DSHPLUSPLUS_DATA_ROOT 指向的目录不动，由用户自行清理）。 }
+{ Uninstall keeps user data: DSHPLUSPLUS_DATA_ROOT is left untouched. }

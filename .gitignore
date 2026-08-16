@@ -19,3 +19,9 @@ release/
 DESIGN.md
 深度求索增强套件完善设计方案_*.md
 便携版使用说明.md
+
+# 完整便携包运行时清单：构建时由 build-portable.ps1 生成，
+# 依赖从 npm registry 拉取（代码库不携带 DSH 本体）。
+runtime/dsh/
+runtime/portable-package.json
+runtime/portable-pnpm-workspace.yaml

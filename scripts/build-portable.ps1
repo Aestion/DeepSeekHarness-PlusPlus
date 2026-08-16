@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$SkipCompile,
     [switch]$SkipZip,
     [string]$McaSource = ''
@@ -89,15 +89,50 @@ if (Test-Path -LiteralPath $launcherExe) {
 
 $deployTarget = Join-Path $stage 'runtime\dsh'
 New-Item -ItemType Directory -Force -Path $deployTarget | Out-Null
-Copy-Item -LiteralPath (Join-Path $workspace 'runtime\portable-package.json') -Destination (Join-Path $deployTarget 'package.json')
-Copy-Item -LiteralPath (Join-Path $workspace 'runtime\portable-pnpm-workspace.yaml') -Destination (Join-Path $deployTarget 'pnpm-workspace.yaml')
+# DSH++ 的代码库不携带 DSH 本体：运行时组装清单由本脚本在构建时生成
+# （DSH 版本取自已提交的 compatibility.json，依赖从 npm registry 拉取）。
+$compat = Get-Content (Join-Path $workspace 'runtime\manifests\compatibility.json') -Raw | ConvertFrom-Json
+$dshVersion = $compat.deepseekHarness.publishedPackageBaseline
+$portablePackage = @"
+{
+  "name": "dshplusplus-portable-runtime",
+  "version": "$version",
+  "private": true,
+  "dependencies": {
+    "@deepseek-ai/dsh": "$dshVersion"
+  }
+}
+"@
+[System.IO.File]::WriteAllText(
+    (Join-Path $deployTarget 'package.json'),
+    $portablePackage,
+    (New-Object System.Text.UTF8Encoding($false))
+)
+$portableWorkspace = @"
+packages:
+  - .
+
+nodeLinker: hoisted
+
+allowBuilds:
+  '@deepseek-ai/dsh-subprocess-local': true
+  '@google/genai': true
+  koffi: true
+  node-pty: true
+  protobufjs: true
+"@
+[System.IO.File]::WriteAllText(
+    (Join-Path $deployTarget 'pnpm-workspace.yaml'),
+    $portableWorkspace,
+    (New-Object System.Text.UTF8Encoding($false))
+)
 $packs = @(
     (Join-Path $workspace '.tmp\packs\dshplusplus-multimodal-0.1.0-dev.1.tgz'),
     (Join-Path $workspace '.tmp\packs\dshplusplus-multimodal-llm-0.1.0-dev.1.tgz'),
     (Join-Path $workspace '.tmp\packs\dshplusplus-multimodal-router-0.1.0-dev.1.tgz'),
     (Join-Path $workspace '.tmp\packs\dshplusplus-bundle-plus-0.1.0-dev.1.tgz')
 )
-pnpm --dir $deployTarget add --save-prod --node-linker=hoisted '@deepseek-ai/dsh@0.1.0-rc.6' @packs
+pnpm --dir $deployTarget add --save-prod --node-linker=hoisted "@deepseek-ai/dsh@$dshVersion" @packs
 if ($LASTEXITCODE -ne 0) { throw 'Portable DSH runtime installation failed.' }
 
 # Strip dev-only artifacts from the portable runtime. Node only executes

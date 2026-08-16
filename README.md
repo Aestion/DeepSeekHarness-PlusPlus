@@ -6,6 +6,8 @@ An enhancement layer for [DeepSeek Harness](https://github.com/deepseek-ai/DeepS
 
 > Status: `0.1.0-dev.1` · Windows x64 · works with DSH `0.1.0-rc.6`
 
+> **Repository scope**: this repository contains **only the DSH++ layer**. The DeepSeek Harness core is an upstream dependency (`@deepseek-ai/dsh`, published by DeepSeek) fetched from the npm registry at build/install time — DSH code, its dependency trees, or bundled copies are never part of this repository. GitHub Releases publish only DSH++ artifacts (the Lite plugin pack); the self-contained portable build is assembled locally by `scripts/build-portable.ps1` (it pulls DSH from npm). See [compatibility.json](runtime/manifests/compatibility.json) for the pinned upstream version.
+
 ## Features
 
 - **Image support for text-only primary models** — images are projected to text observations by an external vision model before they reach the DeepSeek API (no image bytes ever go to DeepSeek).
@@ -43,18 +45,11 @@ An enhancement layer for [DeepSeek Harness](https://github.com/deepseek-ai/DeepS
 └──────────────────────────────┘   └───────────────────────────┘
 ```
 
-## Quick start (portable build)
+## Quick start
 
-1. Download the latest release archive and extract it anywhere.
-2. Double-click `DSHPlusPlus.exe`, configure an optional vision model (multimodal expert), then click **启动 DSH**.
-3. Configure the primary DeepSeek model in DSH (`设置 → 模型`).
-4. Send an image — it is described by the vision model and projected into the conversation.
+**Option A — Lite plugin pack (recommended, a few MB).** Already have DeepSeek Harness installed? Download the **Lite** release asset (`DSHPlusPlus-lite-*.zip`, ~30 KB): it contains only the five plugin packages plus a one-click installer that targets your existing DSH profile — no bundled Node/DSH/MCA runtime. Requirements: Node.js 22+, pnpm, and `dsh` in PATH. Unzip, then run `安装到已有DSH.cmd` (or `node install.mjs`) and start with `dsh --profile dshplusplus`. Full CLI options are in `使用说明.md`.
 
-> DSH data lives in the standard dsh home (`~/.dsh`); the `.portable` folder only holds DSH++'s own config, logs and sidecar data.
-
-## Lite plugin pack (a few MB)
-
-Already have DeepSeek Harness installed? Use the **Lite** release asset (`DSHPlusPlus-lite-*.zip`, ~30 KB): it contains only the five plugin packages plus a one-click installer that targets your existing DSH profile — no bundled Node/DSH/MCA runtime. Requirements: Node.js 22+, pnpm, and `dsh` in PATH. Unzip, then run `安装到已有DSH.cmd` (or `node install.mjs`) and start with `dsh --profile dshplusplus`. Full CLI options are in `使用说明.md`.
+**Option B — self-contained portable build (assembled locally).** Run `powershell -File scripts/build-portable.ps1` in a checkout: it compiles the control center, pulls DSH from npm, and assembles `release/DSHPlusPlus-<version>-windows-x64/` (DSH data still lives in `~/.dsh`; the `.portable` folder only holds DSH++'s own config, logs and sidecar data). Double-click `DSHPlusPlus.exe`, configure an optional vision model (multimodal expert), click **启动 DSH**, configure the primary model in DSH (`设置 → 模型`), then send an image — it is described by the vision model and projected into the conversation.
 
 ## Install as a plugin into an existing DSH
 

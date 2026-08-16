@@ -6,6 +6,8 @@ DeepSeek Harness（DSH）的增强层：为 DSH 补充**多模态视觉、网页
 
 > 状态：`0.1.0-dev.1` · Windows x64 · 配套 DSH `0.1.0-rc.6`
 
+> **仓库范围**：本仓库**只包含 DSH++ 层**。DeepSeek Harness 核心是上游依赖（DeepSeek 官方发布的 `@deepseek-ai/dsh`），在构建/安装时从 npm registry 拉取——DSH 代码、依赖树或捆绑副本不会出现在本仓库。GitHub Release 只发布 DSH++ 自身的产物（Lite 插件包）；自包含便携版由 `scripts/build-portable.ps1` 本地组装（构建时从 npm 拉取 DSH）。上游版本锁定见 [compatibility.json](runtime/manifests/compatibility.json)。
+
 ## 功能特性
 
 - **为纯文本主模型补上图片能力**——图片先由外部视觉模型投影为文本观察，再交给 DeepSeek API（图片字节不会直达 DeepSeek）。
@@ -43,18 +45,11 @@ DeepSeek Harness（DSH）的增强层：为 DSH 补充**多模态视觉、网页
 └──────────────────────────────┘   └───────────────────────────┘
 ```
 
-## 快速开始（便携版）
+## 快速开始
 
-1. 下载最新 Release 压缩包并解压到任意目录。
-2. 双击 `DSHPlusPlus.exe`，按需配置视觉模型（多模态专家），点击**启动 DSH**。
-3. 在 DSH 的 `设置 → 模型` 中配置主模型。
-4. 发送一张图片——它会被视觉模型描述并投影进对话。
+**方式 A — Lite 插件包（推荐，几 MB）。** 已经装有 DeepSeek Harness？下载 **Lite** 版 Release 资产（`DSHPlusPlus-lite-*.zip`，约 30 KB）：只含五个插件包 + 一键安装器，装进你已有的 DSH Profile——**不携带 Node/DSH/MCA 运行时**。要求：Node.js 22+、pnpm、`dsh` 在 PATH 中。解压后运行「安装到已有DSH.cmd」（或 `node install.mjs`），用 `dsh --profile dshplusplus` 启动。完整参数见「使用说明.md」。
 
-> DSH 数据存放在标准 dsh home（`~/.dsh`）；`.portable` 目录只放 DSH++ 自身的配置、日志与 Sidecar 数据。
-
-## Lite 插件包（几 MB）
-
-已经装有 DeepSeek Harness？用 **Lite** 版 Release 资产（`DSHPlusPlus-lite-*.zip`，约 30 KB）：只含五个插件包 + 一键安装器，装进你已有的 DSH Profile——**不携带 Node/DSH/MCA 运行时**。要求：Node.js 22+、pnpm、`dsh` 在 PATH 中。解压后运行「安装到已有DSH.cmd」（或 `node install.mjs`），用 `dsh --profile dshplusplus` 启动。完整参数见「使用说明.md」。
+**方式 B — 自包含便携版（本地组装）。** 在源码检出目录运行 `powershell -File scripts/build-portable.ps1`：编译控制中心、从 npm 拉取 DSH、组装 `release/DSHPlusPlus-<version>-windows-x64/`（DSH 数据仍存放在标准 dsh home `~/.dsh`；`.portable` 目录只放 DSH++ 自身的配置、日志与 Sidecar 数据）。双击 `DSHPlusPlus.exe`，按需配置视觉模型（多模态专家），点击**启动 DSH**，在 DSH 的 `设置 → 模型` 配置主模型，然后发送一张图片——它会被视觉模型描述并投影进对话。
 
 ## 作为插件安装到已有 DSH
 
