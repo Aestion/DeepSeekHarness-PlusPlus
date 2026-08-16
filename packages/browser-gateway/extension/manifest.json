@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "DSH++ Browser Control",
+  "version": "0.1.0",
+  "description": "让 DSH++（chromeUse 能力）在您已打开的 Chrome 中安全查看与操作页面：观察、点击、输入、按键、标签管理。",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0gBCih4u91IWK+SuMsweIrJpQFfvybV2ySY+j6kwAlrVsBdhGoXdumL0yGf56dqmwD5v6DbXMd8fw/UwzLbTq0N4OpAKU7bRcz2BZBagzxCQ5Ftky9rUgackf/P2RKcwo588RP2Xcn9XVJ4EaLzhks7tilItpZIpbPdRjcO5pAx6rzD0bqDiZn7XFyHL2HqokxIMmLUMJjtc2be6WiWGjm9950iCZOOfa8+I8zJTWTOj2gC3yu0w/N4yNEBjYFyLosvxSdvbrQqcTCKmzEh7KnvYQM92WkwN4coNjrqt5b/QhkoH0td04lzAXr0tl0Oa6GxKgrERy6KAs1P8lz+9RQIDAQAB",
+  "permissions": ["nativeMessaging", "tabs", "activeTab", "alarms", "debugger"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

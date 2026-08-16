@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "DSH++ desktop window permissions",
+  "windows": ["main", "dsh"],
+  "permissions": ["core:default"]
+}

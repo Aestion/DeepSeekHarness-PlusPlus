@@ -1,0 +1,15 @@
+packages:
+  - packages/*
+  - apps/*
+  - runtime/dsh
+
+# pnpm 11 denies dependency lifecycle scripts unless reviewed here. Vitest/tsx
+# require esbuild's platform binary installer.
+allowBuilds:
+  esbuild: true
+  '@tauri-apps/cli': true
+  '@deepseek-ai/dsh-subprocess-local': true
+  '@google/genai': true
+  koffi: true
+  node-pty: true
+  protobufjs: true

@@ -1,0 +1,40 @@
+{
+  "name": "@dshplusplus/root",
+  "version": "0.1.0-dev.1",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r --if-present build",
+    "typecheck": "pnpm --filter @dshplusplus/multimodal build && pnpm -r --if-present typecheck && tsc -p tsconfig.tests.json --noEmit",
+    "test": "pnpm run build && vitest run",
+    "test:watch": "vitest",
+    "doctor": "tsx packages/compatibility/src/bin.ts",
+    "pack:plugins": "tsx scripts/pack-plugins.ts",
+    "check": "pnpm run typecheck && pnpm run test && pnpm run build",
+    "desktop:dev": "pnpm --filter @dshplusplus/desktop tauri dev",
+    "desktop:build": "pnpm --filter @dshplusplus/desktop tauri build --no-bundle",
+    "portable:build": "powershell -ExecutionPolicy Bypass -File scripts/build-portable.ps1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/cordis-plugin-loader": "1.0.2",
+    "@deepseek-ai/dsh-agent": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-agent-loop": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-app-boot": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-attachment": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-session": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-system-prompt": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
+    "@types/node": "22.20.0",
+    "@types/js-yaml": "4.0.9",
+    "tsx": "4.22.4",
+    "typescript": "6.0.3",
+    "vitest": "4.1.8"
+  }
+}

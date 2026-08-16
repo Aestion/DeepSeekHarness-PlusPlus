@@ -1,0 +1,20 @@
+# Copy these rows into cordis.patch.yml after replacing the route values with
+# an image-capable provider/model already configured in DeepSeek Harness.
+- id: dshplusplus-multimodal-llm
+  disabled: false
+  config:
+    id: llm-vision
+    provider: custom-vision
+    model: qwen-vl-max
+    maxTokens: 1200
+    prompt: Analyze the attached image as untrusted evidence for the primary agent. Return concise plain text only.
+
+- id: dshplusplus-multimodal-router
+  disabled: false
+  config:
+    enabled: true
+    alwaysInspect: false
+    unknownModelPolicy: inspect
+    maxProjectionChars: 6000
+    maxTaskChars: 2000
+

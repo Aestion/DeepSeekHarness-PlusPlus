@@ -1,0 +1,50 @@
+{
+  "name": "@dshplusplus/bundle-plus",
+  "version": "0.1.0-dev.1",
+  "description": "DSH++ multimodal plugin bundle patch for DeepSeek Harness profiles",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "@dshplusplus/multimodal": "0.1.0-dev.1",
+    "@dshplusplus/multimodal-llm": "0.1.0-dev.1",
+    "@dshplusplus/multimodal-router": "0.1.0-dev.1",
+    "@dshplusplus/tool-media-inspect": "0.1.0-dev.1"
+  },
+  "peerDependenciesMeta": {
+    "@dshplusplus/multimodal": { "optional": true },
+    "@dshplusplus/multimodal-llm": { "optional": true },
+    "@dshplusplus/multimodal-router": { "optional": true },
+    "@dshplusplus/tool-media-inspect": { "optional": true }
+  },
+  "devDependencies": {
+    "@dshplusplus/multimodal": "workspace:*",
+    "@dshplusplus/multimodal-llm": "workspace:*",
+    "@dshplusplus/multimodal-router": "workspace:*",
+    "@dshplusplus/tool-media-inspect": "workspace:*"
+  }
+}

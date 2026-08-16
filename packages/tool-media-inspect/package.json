@@ -1,0 +1,37 @@
+{
+  "name": "@dshplusplus/tool-media-inspect",
+  "version": "0.1.0-dev.1",
+  "description": "Explicit media_inspect tool for DSH++ multimodal observations",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "README.md"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
+    "@dshplusplus/multimodal": "workspace:*"
+  },
+  "peerDependenciesMeta": {
+    "@dshplusplus/multimodal": { "optional": true }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
+    "@dshplusplus/multimodal": "workspace:*"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "dsh-profile-plus",
+  "private": true,
+  "dependencies": {
+    "@dshplusplus/bundle-plus": "0.1.0-dev.1",
+    "@dshplusplus/multimodal": "0.1.0-dev.1",
+    "@dshplusplus/multimodal-llm": "0.1.0-dev.1",
+    "@dshplusplus/multimodal-router": "0.1.0-dev.1"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-web-app",
+        "@dshplusplus/bundle-plus"
+      ]
+    }
+  }
+}

@@ -1,0 +1,3127 @@
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::webview::NewWindowResponse;
+use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
+
+/// 统一版本号：由 build.rs 从根 package.json 注入（单一来源）。
+const VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/version.txt"));
+const MCA_PORT: u16 = 18765;
+/// DSH++ browser gateway (CDP-managed Chrome + shared-tab bridge).
+const BROWSER_PORT: u16 = 18766;
+/// Label of the embedded DSH desktop window (WebView2, loads the DSH web UI).
+const DSH_WINDOW_LABEL: &str = "dsh";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(default)]
+struct StoredConfig {
+    dsh_host: String,
+    dsh_port: u16,
+    workspace: String,
+    /// 可选远程更新源（JSON：{"version":"x.y.z","url":"https://…/DSHPlusPlus.update.exe"}）。
+    /// 为空时"检查更新"只检测本地暂存的 DSHPlusPlus.update.exe。
+    update_url: String,
+    auto_start_dsh: bool,
+    auto_open_dsh_window: bool,
+    enable_mca: bool,
+    enable_browser: bool,
+    enable_chrome_use: bool,
+    mca_image: bool,
+    mca_video: bool,
+    mca_audio: bool,
+    mca_document: bool,
+    mca_web: bool,
+    mca_computer_observe: bool,
+    mca_computer_act: bool,
+    deepseek_base_url: String,
+    deepseek_model: String,
+    deepseek_secret: Option<String>,
+    vision_provider: String,
+    vision_base_url: String,
+    vision_model: String,
+    vision_api: String,
+    vision_secret: Option<String>,
+    enable_multimodal: bool,
+}
+
+impl Default for StoredConfig {
+    fn default() -> Self {
+        Self {
+            dsh_host: "127.0.0.1".into(),
+            dsh_port: 18760,
+            workspace: std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            update_url: String::new(),
+            auto_start_dsh: false,
+            auto_open_dsh_window: true,
+            enable_mca: true,
+            enable_browser: true,
+            enable_chrome_use: true,
+            mca_image: true,
+            mca_video: true,
+            mca_audio: true,
+            mca_document: true,
+            mca_web: true,
+            mca_computer_observe: false,
+            mca_computer_act: false,
+            deepseek_base_url: "https://api.deepseek.com".into(),
+            deepseek_model: "deepseek-chat".into(),
+            deepseek_secret: None,
+            vision_provider: "vision-gateway".into(),
+            vision_base_url: String::new(),
+            vision_model: String::new(),
+            vision_api: "openai-completions".into(),
+            vision_secret: None,
+            enable_multimodal: true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigInput {
+    dsh_host: String,
+    dsh_port: u16,
+    workspace: String,
+    update_url: String,
+    auto_start_dsh: bool,
+    auto_open_dsh_window: bool,
+    enable_mca: bool,
+    enable_browser: bool,
+    enable_chrome_use: bool,
+    mca_image: bool,
+    mca_video: bool,
+    mca_audio: bool,
+    mca_document: bool,
+    mca_web: bool,
+    mca_computer_observe: bool,
+    mca_computer_act: bool,
+    deepseek_base_url: String,
+    deepseek_model: String,
+    deepseek_api_key: Option<String>,
+    vision_provider: String,
+    vision_base_url: String,
+    vision_model: String,
+    vision_api: String,
+    vision_api_key: Option<String>,
+    enable_multimodal: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigView {
+    dsh_host: String,
+    dsh_port: u16,
+    workspace: String,
+    update_url: String,
+    auto_start_dsh: bool,
+    auto_open_dsh_window: bool,
+    enable_mca: bool,
+    enable_browser: bool,
+    enable_chrome_use: bool,
+    mca_image: bool,
+    mca_video: bool,
+    mca_audio: bool,
+    mca_document: bool,
+    mca_web: bool,
+    mca_computer_observe: bool,
+    mca_computer_act: bool,
+    deepseek_base_url: String,
+    deepseek_model: String,
+    has_deepseek_key: bool,
+    vision_provider: String,
+    vision_base_url: String,
+    vision_model: String,
+    vision_api: String,
+    has_vision_key: bool,
+    enable_multimodal: bool,
+}
+
+impl From<&StoredConfig> for ConfigView {
+    fn from(value: &StoredConfig) -> Self {
+        Self {
+            dsh_host: value.dsh_host.clone(),
+            dsh_port: value.dsh_port,
+            workspace: value.workspace.clone(),
+            update_url: value.update_url.clone(),
+            auto_start_dsh: value.auto_start_dsh,
+            auto_open_dsh_window: value.auto_open_dsh_window,
+            enable_mca: value.enable_mca,
+            enable_browser: value.enable_browser,
+            enable_chrome_use: value.enable_chrome_use,
+            mca_image: value.mca_image,
+            mca_video: value.mca_video,
+            mca_audio: value.mca_audio,
+            mca_document: value.mca_document,
+            mca_web: value.mca_web,
+            mca_computer_observe: value.mca_computer_observe,
+            mca_computer_act: value.mca_computer_act,
+            deepseek_base_url: value.deepseek_base_url.clone(),
+            deepseek_model: value.deepseek_model.clone(),
+            has_deepseek_key: value.deepseek_secret.is_some(),
+            vision_provider: value.vision_provider.clone(),
+            vision_base_url: value.vision_base_url.clone(),
+            vision_model: value.vision_model.clone(),
+            vision_api: value.vision_api.clone(),
+            has_vision_key: value.vision_secret.is_some(),
+            enable_multimodal: value.enable_multimodal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeInfo {
+    portable: bool,
+    data_root: String,
+    dsh_home: Option<String>,
+    dsh_cli: Option<String>,
+    node_binary: Option<String>,
+    mca_binary: Option<String>,
+    browser_gateway: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ServiceState {
+    Stopped,
+    Starting,
+    Running,
+    Error,
+}
+
+struct ManagedChild {
+    child: Option<Child>,
+    #[cfg(target_os = "windows")]
+    job_handle: Option<isize>,
+    state: ServiceState,
+    message: String,
+}
+
+impl ManagedChild {
+    fn stopped(message: &str) -> Self {
+        Self {
+            child: None,
+            #[cfg(target_os = "windows")]
+            job_handle: None,
+            state: ServiceState::Stopped,
+            message: message.into(),
+        }
+    }
+
+    fn stop(&mut self) {
+        #[cfg(target_os = "windows")]
+        if let Some(handle) = self.job_handle.take() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(handle as _);
+            }
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.state = ServiceState::Stopped;
+        self.message = "已停止".into();
+    }
+
+    fn refresh(&mut self, host: &str, port: u16) {
+        if let Some(child) = self.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    self.child = None;
+                    #[cfg(target_os = "windows")]
+                    if let Some(handle) = self.job_handle.take() {
+                        unsafe {
+                            windows_sys::Win32::Foundation::CloseHandle(handle as _);
+                        }
+                    }
+                    if port_open(host, port) {
+                        self.state = ServiceState::Running;
+                        self.message = format!("已连接到正在监听的服务（启动进程退出：{status}）");
+                    } else {
+                        self.state = ServiceState::Error;
+                        self.message = format!("进程已退出（{status}）");
+                    }
+                }
+                Ok(None) => {
+                    if port_open(host, port) {
+                        self.state = ServiceState::Running;
+                        self.message = format!("正在监听 {host}:{port}");
+                    } else if !matches!(self.state, ServiceState::Error) {
+                        self.state = ServiceState::Starting;
+                        self.message = "进程已创建，等待服务就绪".into();
+                    }
+                }
+                Err(error) => {
+                    self.state = ServiceState::Error;
+                    self.message = error.to_string();
+                }
+            }
+        } else if matches!(self.state, ServiceState::Running) {
+            if !port_open(host, port) {
+                self.state = ServiceState::Stopped;
+                self.message = "服务连接已断开".into();
+            }
+        } else if !matches!(self.state, ServiceState::Starting | ServiceState::Error) {
+            self.state = ServiceState::Stopped;
+        }
+    }
+}
+
+struct AppState {
+    config: Mutex<StoredConfig>,
+    dsh: Mutex<ManagedChild>,
+    mca: Mutex<ManagedChild>,
+    browser: Mutex<ManagedChild>,
+    runtime: RuntimePaths,
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        unregister_chrome_native_host();
+        if let Ok(dsh) = self.dsh.get_mut() {
+            dsh.stop();
+        }
+        if let Ok(mca) = self.mca.get_mut() {
+            mca.stop();
+        }
+        if let Ok(browser) = self.browser.get_mut() {
+            browser.stop();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn unregister_chrome_native_host() {
+    let mut command = Command::new("reg");
+    command.args([
+        "delete",
+        r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.dshplusplus.browser",
+        "/f",
+    ]);
+    hide_console(&mut command);
+    let _ = command.output();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unregister_chrome_native_host() {}
+
+#[derive(Debug, Clone)]
+struct RuntimePaths {
+    portable: bool,
+    data_root: PathBuf,
+    /// dsh 数据目录。`None` = 使用 dsh 标准 home（~/.dsh），与用户自装
+    /// dsh 共享数据；`Some` = 显式指定（便携模式或 DSHPLUSPLUS_DSH_HOME）。
+    dsh_home: Option<PathBuf>,
+    node: Option<PathBuf>,
+    dsh_cli: Option<PathBuf>,
+    mca: Option<PathBuf>,
+    browser_gateway: Option<PathBuf>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppSnapshot {
+    version: &'static str,
+    config: ConfigView,
+    runtime: RuntimeInfo,
+    dsh_state: ServiceState,
+    dsh_url: String,
+    dsh_pid: Option<u32>,
+    dsh_message: String,
+    mca_state: ServiceState,
+    mca_url: Option<String>,
+    mca_pid: Option<u32>,
+    mca_message: String,
+    mca_route: Option<McaRouteView>,
+    mca_providers: Vec<McaProviderView>,
+    browser_state: ServiceState,
+    browser_pid: Option<u32>,
+    browser_message: String,
+}
+
+/// MCA deepseek-tui 路由的实时能力与健康视图（供 UI 动态化能力开关）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McaRouteView {
+    agent_id: String,
+    route_available: bool,
+    /// 当前已启用的能力（image/video/audio/document/web/computer.observe/computer.act）。
+    capabilities: Vec<String>,
+    /// 路由声明可用的能力全集。
+    available_capabilities: Vec<String>,
+    /// 电脑 Provider 是否启用（false 时 computer.* 实际不可用）。
+    computer_provider_enabled: bool,
+    /// 路由健康总评（ready / not_checked / unavailable / disabled）。
+    health: String,
+    /// 首个阻塞层的具体原因（无阻塞层时为空）。
+    health_detail: String,
+}
+
+/// MCA 单个 Provider 的工具级健康（供 UI 能力卡片展示）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McaProviderView {
+    provider_id: String,
+    enabled: bool,
+    available: bool,
+    detail: String,
+}
+
+fn path_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+fn find_project_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|path| {
+            path.join("runtime/dsh/package.json").is_file()
+                && path.join("packages/bundle-plus/package.json").is_file()
+        })
+        .map(Path::to_path_buf)
+}
+
+fn discover_runtime() -> Result<RuntimePaths, String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let exe_dir = exe.parent().ok_or("无法解析程序目录")?.to_path_buf();
+    let sibling_node = exe_dir.join("runtime/node/node.exe");
+    let sibling_dsh = exe_dir.join("runtime/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js");
+    let sibling_mca = exe_dir.join("runtime/mca/mca-runtime.exe");
+    let sibling_browser = exe_dir.join("runtime/browser/gateway.js");
+    let portable = sibling_node.is_file() && sibling_dsh.is_file();
+
+    let project = find_project_root(&exe_dir)
+        .or_else(|| find_project_root(Path::new(env!("CARGO_MANIFEST_DIR"))));
+    let project_node = PathBuf::from(r"C:\Program Files\nodejs\node.exe");
+    let project_dsh = project
+        .as_ref()
+        .map(|root| root.join("runtime/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"));
+    let project_mca = project.as_ref().map(|_| {
+        PathBuf::from(r"E:\MCA — Multi-Modal Content Adapter\build\sidecar\mca-runtime.exe")
+    });
+    let project_browser = project
+        .as_ref()
+        .map(|root| root.join("packages/browser-gateway/lib/index.js"));
+
+    let node = std::env::var_os("DSHPLUSPLUS_NODE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| sibling_node.is_file().then_some(sibling_node))
+        .or_else(|| project_node.is_file().then_some(project_node));
+    let dsh_cli = std::env::var_os("DSHPLUSPLUS_DSH_CLI")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| sibling_dsh.is_file().then_some(sibling_dsh))
+        .or_else(|| project_dsh.filter(|path| path.is_file()))
+        .or_else(|| {
+            let source = PathBuf::from(r"D:\DeepSeekHarness\apps\cli\lib\bin.js");
+            source.is_file().then_some(source)
+        });
+    let mca = std::env::var_os("DSHPLUSPLUS_MCA")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| sibling_mca.is_file().then_some(sibling_mca))
+        .or_else(|| project_mca.filter(|path| path.is_file()));
+    let browser_gateway = std::env::var_os("DSHPLUSPLUS_BROWSER")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| sibling_browser.is_file().then_some(sibling_browser))
+        .or_else(|| project_browser.filter(|path| path.is_file()));
+
+    let data_root = std::env::var_os("DSHPLUSPLUS_DATA_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if portable {
+                exe_dir.join(".portable")
+            } else {
+                project.unwrap_or(exe_dir).join(".tmp/desktop-data")
+            }
+        });
+    fs::create_dir_all(&data_root).map_err(|error| format!("无法创建数据目录：{error}"))?;
+    // dsh 数据目录：默认与用户自装 dsh 共享标准 home（~/.dsh），卸载/更新
+    // dsh++ 不影响 dsh 数据；仅显式要求便携时才放回包内数据目录。
+    let dsh_home = std::env::var_os("DSHPLUSPLUS_DSH_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            if std::env::var_os("DSHPLUSPLUS_PORTABLE").is_some() {
+                Some(data_root.join("dsh-home"))
+            } else {
+                None
+            }
+        });
+    Ok(RuntimePaths {
+        portable,
+        data_root,
+        dsh_home,
+        node,
+        dsh_cli,
+        mca,
+        browser_gateway,
+    })
+}
+
+/// dsh 的标准数据目录：不设 `DSH_HOME` 时 dsh 使用 `~/.dsh`
+/// （与 `@deepseek-ai/dsh-home-paths` 的 `defaultDshHome` 一致）。
+fn default_dsh_home() -> Option<PathBuf> {
+    let base = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    Some(PathBuf::from(base).join(".dsh"))
+}
+
+/// 本次启动实际使用的 dsh home：显式指定 > 便携模式 > 标准 home > 兜底。
+fn effective_dsh_home(runtime: &RuntimePaths) -> PathBuf {
+    runtime
+        .dsh_home
+        .clone()
+        .or_else(default_dsh_home)
+        .unwrap_or_else(|| runtime.data_root.join("dsh-home"))
+}
+
+/// 旧便携 home → 标准 home 的一次性数据迁移（幂等，可反复执行）：
+/// 1. 复制标准 home 缺失的会话日志目录（按 session id 判重）；
+/// 2. 合并 workspace 注册表（按 path 判重，目标文件缺失则整体复制）；
+/// 3. 首启补全 settings.yaml 与匿名身份（目标缺失时继承）。
+///
+/// 仅在本次启动使用标准 home（未显式指定 DSHPLUSPLUS_DSH_HOME /
+/// DSHPLUSPLUS_PORTABLE）且旧便携 home 存在时执行。这样卸载、更新 dsh++
+/// 不会影响 dsh 数据，而升级前已在 .portable 里产生的会话仍能找回。
+fn migrate_portable_home_data(runtime: &RuntimePaths) -> Result<(), String> {
+    if runtime.dsh_home.is_some() {
+        return Ok(()); // 显式指定了 home（含便携模式）：不迁移
+    }
+    let Some(target) = default_dsh_home() else {
+        return Ok(());
+    };
+    let legacy = runtime.data_root.join("dsh-home");
+    if !legacy.is_dir() {
+        return Ok(()); // 没有旧便携 home
+    }
+    // 1) 会话日志：复制缺失的会话目录（保持 sessions/<project>/<session> 布局）
+    let legacy_sessions = legacy.join("sessions");
+    let target_sessions = target.join("sessions");
+    if legacy_sessions.is_dir() {
+        let mut copied = 0usize;
+        for project in fs::read_dir(&legacy_sessions).map_err(|error| error.to_string())? {
+            let project = project.map_err(|error| error.to_string())?;
+            if !project.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let project_name = project.file_name();
+            for session in fs::read_dir(project.path()).map_err(|error| error.to_string())? {
+                let session = session.map_err(|error| error.to_string())?;
+                if !session.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let dest = target_sessions.join(&project_name).join(session.file_name());
+                if dest.join("session.jsonl.zstd").is_file()
+                    || dest.join("session.jsonl").is_file()
+                {
+                    continue; // 目标已有该会话
+                }
+                copy_directory(&session.path(), &dest)?;
+                copied += 1;
+            }
+        }
+        if copied > 0 {
+            eprintln!(
+                "[dshplusplus] 已将 {copied} 个会话从 {} 迁移到 {}",
+                path_string(&legacy),
+                path_string(&target)
+            );
+        }
+    }
+    // 2) workspace 注册表：按 path 合并缺失记录
+    merge_workspace_registry(
+        &legacy.join("storages/workspace.json"),
+        &target.join("storages/workspace.json"),
+    )?;
+    // 3) 首启补全：settings.yaml 与匿名身份在目标缺失时继承
+    for name in ["settings.yaml", ".anonymous-user-id"] {
+        let src = legacy.join(name);
+        let dst = target.join(name);
+        if src.is_file() && !dst.exists() {
+            fs::copy(&src, &dst)
+                .map_err(|error| format!("无法复制 {name}：{error}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// 合并 workspace.json：把 legacy 中目标没有的 workspace 记录（按 path 判重）
+/// 并入目标注册表，并把新 id 追加到全局顺序。目标文件缺失时整体复制。
+fn merge_workspace_registry(legacy: &Path, target: &Path) -> Result<(), String> {
+    if !legacy.is_file() {
+        return Ok(());
+    }
+    let legacy_value: serde_json::Value = serde_json::from_slice(
+        &fs::read(legacy).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if !target.is_file() {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        fs::copy(legacy, target).map_err(|error| error.to_string())?;
+        eprintln!(
+            "[dshplusplus] workspace 注册表已复制到 {}",
+            path_string(target)
+        );
+        return Ok(());
+    }
+    let mut target_value: serde_json::Value = serde_json::from_slice(
+        &fs::read(target).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let Some(legacy_ws) = legacy_value
+        .get("tables")
+        .and_then(|tables| tables.get("workspaces"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(());
+    };
+    let Some(target_ws) = target_value
+        .get_mut("tables")
+        .and_then(|tables| tables.get_mut("workspaces"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+    let mut target_paths: std::collections::HashSet<String> = target_ws
+        .values()
+        .filter_map(|record| record.get("path").and_then(serde_json::Value::as_str))
+        .map(String::from)
+        .collect();
+    let mut merged = false;
+    let mut inserted_ids: Vec<String> = Vec::new();
+    for (id, record) in legacy_ws {
+        if target_ws.contains_key(id) {
+            continue;
+        }
+        let Some(path) = record.get("path").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if target_paths.contains(path) {
+            continue;
+        }
+        target_ws.insert(id.clone(), record.clone());
+        target_paths.insert(path.to_string());
+        inserted_ids.push(id.clone());
+        merged = true;
+    }
+    if !merged {
+        return Ok(());
+    }
+    if let Some(ids) = target_value
+        .get_mut("global")
+        .and_then(|global| global.get_mut("workspaceIds"))
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for id in inserted_ids {
+            if !ids.iter().any(|value| value.as_str() == Some(id.as_str())) {
+                ids.push(serde_json::Value::String(id));
+            }
+        }
+    }
+    write_atomic(
+        target,
+        serde_json::to_vec_pretty(&target_value)
+            .map_err(|error| error.to_string())?
+            .as_slice(),
+    )?;
+    eprintln!(
+        "[dshplusplus] workspace 注册表已合并到 {}",
+        path_string(target)
+    );
+    Ok(())
+}
+
+fn config_path(runtime: &RuntimePaths) -> PathBuf {
+    runtime.data_root.join("dshplusplus.json")
+}
+
+fn load_config(runtime: &RuntimePaths) -> StoredConfig {
+    fs::read_to_string(config_path(runtime))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let temp = path.with_extension("tmp");
+    fs::write(&temp, content).map_err(|error| error.to_string())?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| error.to_string())?;
+    }
+    fs::rename(temp, path).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn protect_secret(secret: &str) -> Result<String, String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+    let bytes = secret.as_bytes();
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: bytes.len() as u32,
+        pbData: bytes.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptProtectData(
+            &input,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        return Err("Windows DPAPI 加密失败".into());
+    }
+    let result = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) };
+    let encoded = BASE64.encode(result);
+    unsafe {
+        LocalFree(output.pbData.cast());
+    }
+    Ok(encoded)
+}
+
+#[cfg(target_os = "windows")]
+fn unprotect_secret(encoded: &str) -> Result<String, String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+    let bytes = BASE64.decode(encoded).map_err(|_| "保存的密钥格式无效")?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: bytes.len() as u32,
+        pbData: bytes.as_ptr() as *mut u8,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+    let ok = unsafe {
+        CryptUnprotectData(
+            &input,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        )
+    };
+    if ok == 0 {
+        return Err("Windows DPAPI 解密失败；密钥可能来自另一台电脑".into());
+    }
+    let result = unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) };
+    let text = String::from_utf8(result.to_vec()).map_err(|_| "解密后的密钥不是 UTF-8")?;
+    unsafe {
+        LocalFree(output.pbData.cast());
+    }
+    Ok(text)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn protect_secret(secret: &str) -> Result<String, String> {
+    Ok(BASE64.encode(secret))
+}
+#[cfg(not(target_os = "windows"))]
+fn unprotect_secret(encoded: &str) -> Result<String, String> {
+    String::from_utf8(BASE64.decode(encoded).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())
+}
+
+fn validate_url(value: &str, field: &str, allow_empty: bool) -> Result<(), String> {
+    if value.is_empty() && allow_empty {
+        return Ok(());
+    }
+    if value.starts_with("https://")
+        || value.starts_with("http://127.0.0.1")
+        || value.starts_with("http://localhost")
+    {
+        return Ok(());
+    }
+    Err(format!("{field} 必须使用 HTTPS；只有本机地址允许 HTTP"))
+}
+
+fn validate_config(input: &ConfigInput) -> Result<(), String> {
+    if input.dsh_host != "127.0.0.1" && input.dsh_host != "localhost" {
+        return Err("DSH 监听地址只能是 127.0.0.1 或 localhost".into());
+    }
+    if input.dsh_port < 1024 {
+        return Err("DSH 端口必须不小于 1024".into());
+    }
+    if input.deepseek_model.is_empty() {
+        return Err("DeepSeek 模型不能为空".into());
+    }
+    if input.mca_computer_act && !input.mca_computer_observe {
+        return Err("启用“操作电脑”时必须同时启用“观察电脑”".into());
+    }
+    validate_url(&input.deepseek_base_url, "DeepSeek Base URL", false)?;
+    if input.enable_multimodal {
+        if input.vision_provider.is_empty()
+            || !input
+                .vision_provider
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        {
+            return Err("多模态 Provider ID 只能包含字母、数字、连字符和下划线".into());
+        }
+        // 视觉模型与 Base URL 允许留空：开关默认开启，配置不完整时
+        // 插件保持禁用（见 materialize_dsh_config），由 UI 提示补充。
+        validate_url(&input.vision_base_url, "多模态 Base URL", true)?;
+    }
+    if !input.workspace.is_empty() && !Path::new(&input.workspace).is_dir() {
+        return Err("默认工作目录不存在".into());
+    }
+    Ok(())
+}
+
+fn yaml_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// dsh-llm-deepseek 的内置默认主模型配置（用户从未显式配置 llm-deepseek 段
+/// 时使用）：apiKeyEnv=DEEPSEEK_API_KEY、baseURL=api.deepseek.com、默认模型
+/// 目录（deepseek-v4-flash / deepseek-v4-pro，容量与 dsh 默认一致）。
+fn default_deepseek_primary_config() -> serde_yaml::Mapping {
+    let mut config = serde_yaml::Mapping::new();
+    config.insert(
+        serde_yaml::Value::String("apiKeyEnv".into()),
+        serde_yaml::Value::String("DEEPSEEK_API_KEY".into()),
+    );
+    config.insert(
+        serde_yaml::Value::String("baseURL".into()),
+        serde_yaml::Value::String("https://api.deepseek.com".into()),
+    );
+    let models: Vec<serde_yaml::Value> = [("deepseek-v4-flash", "DeepSeek-V4-Flash"), ("deepseek-v4-pro", "DeepSeek-V4-Pro")]
+        .into_iter()
+        .map(|(id, name)| {
+            let mut model = serde_yaml::Mapping::new();
+            model.insert(
+                serde_yaml::Value::String("id".into()),
+                serde_yaml::Value::String(id.into()),
+            );
+            model.insert(
+                serde_yaml::Value::String("name".into()),
+                serde_yaml::Value::String(name.into()),
+            );
+            model.insert(
+                serde_yaml::Value::String("contextWindow".into()),
+                serde_yaml::Value::Number(1_000_000u64.into()),
+            );
+            model.insert(
+                serde_yaml::Value::String("maxTokens".into()),
+                serde_yaml::Value::Number(256_000u64.into()),
+            );
+            serde_yaml::Value::Mapping(model)
+        })
+        .collect();
+    config.insert(
+        serde_yaml::Value::String("models".into()),
+        serde_yaml::Value::Sequence(models),
+    );
+    config
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+    for entry in fs::read_dir(source)
+        .map_err(|error| format!("无法读取 {}：{error}", path_string(source)))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let metadata = fs::metadata(&from).map_err(|error| error.to_string())?;
+        if metadata.is_dir() {
+            copy_directory(&from, &to)?;
+        } else if metadata.is_file() {
+            fs::copy(&from, &to)
+                .map_err(|error| format!("无法复制 {}：{error}", path_string(&from)))?;
+        }
+    }
+    Ok(())
+}
+
+fn materialize_profile_plugins(runtime: &RuntimePaths, profile: &Path) -> Result<(), String> {
+    let Some(cli) = runtime.dsh_cli.as_deref() else {
+        return Err("未找到 DSH 运行时".into());
+    };
+    let node_modules = cli
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "node_modules"))
+        .ok_or("无法定位便携 DSH node_modules")?;
+    let source_scope = node_modules.join("@dshplusplus");
+    if !source_scope.is_dir() {
+        return Err("便携运行时缺少 @dshplusplus 插件包".into());
+    }
+    let destination_scope = profile.join("node_modules/@dshplusplus");
+    for package in [
+        "multimodal",
+        "multimodal-llm",
+        "multimodal-router",
+        "tool-media-inspect",
+        "bundle-plus",
+    ] {
+        let source = source_scope.join(package);
+        if !source.is_dir() {
+            return Err(format!("便携运行时缺少 @dshplusplus/{package}"));
+        }
+        copy_directory(&source, &destination_scope.join(package))?;
+    }
+    Ok(())
+}
+
+fn materialize_dsh_config(
+    runtime: &RuntimePaths,
+    config: &StoredConfig,
+    home: &Path,
+) -> Result<PathBuf, String> {
+    // 命名空间化 profile 名：避免与用户自装 dsh 的 profiles/plus 冲突。
+    let profile = home.join("profiles/dshplusplus");
+    fs::create_dir_all(&profile).map_err(|error| error.to_string())?;
+    materialize_profile_plugins(runtime, &profile)?;
+    let manifest = json!({
+        "name": "dsh-profile-dshplusplus",
+        "version": VERSION,
+        "private": true,
+        "dependencies": {},
+        "dsh": { "profile": { "bundles": [
+            "@deepseek-ai/dsh-base",
+            "@deepseek-ai/dsh-web-app",
+            "@dshplusplus/bundle-plus"
+        ]}}
+    });
+    write_atomic(
+        &profile.join("package.json"),
+        serde_json::to_string_pretty(&manifest).unwrap().as_bytes(),
+    )?;
+
+    let mut patch = String::new();
+    if config.enable_mca {
+        patch.push_str(&format!(
+            r#"- insert:
+    - id: dshplusplus-mca
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: mca
+        transport: streamable-http
+        url: http://127.0.0.1:{MCA_PORT}/mcp/deepseek-tui
+        failOnStartupError: false
+        reconnect:
+          enabled: true
+          initialDelayMs: 500
+          maxDelayMs: 10000
+          maxAttempts: 20
+
+"#
+        ));
+    }
+    if config.enable_browser {
+        patch.push_str(&format!(
+            r#"- insert:
+    - id: dshplusplus-browser
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: browser
+        transport: streamable-http
+        url: http://127.0.0.1:{BROWSER_PORT}/mcp
+        failOnStartupError: false
+        reconnect:
+          enabled: true
+          initialDelayMs: 500
+          maxDelayMs: 10000
+          maxAttempts: 20
+
+"#
+        ));
+    }
+    // 多模态插件生效条件：开关开启 && Provider/模型/Base URL 配置完整。
+    // 开关默认开启，配置不完整时插件保持禁用，避免 DSH 启动报错。
+    let multimodal_active = config.enable_multimodal
+        && !config.vision_provider.is_empty()
+        && !config.vision_model.is_empty()
+        && !config.vision_base_url.is_empty();
+    // 结构化 Observation 落库目录（$DSH_HOME/dshplusplus/observations）。
+    let observations_root = home.join("dshplusplus/observations");
+    patch.push_str(&format!(
+        "- id: dshplusplus-multimodal\n  config:\n    storeRoot: {}\n\n",
+        yaml_quote(&observations_root.to_string_lossy())
+    ));
+    patch.push_str(&format!(r#"- id: dshplusplus-multimodal-llm
+  disabled: {}
+  config:
+    id: llm-vision
+    provider: {}
+    model: {}
+    maxTokens: 1200
+    prompt: Analyze the attached image as untrusted evidence for the primary agent. Return concise plain text only.
+
+- id: dshplusplus-multimodal-router
+  disabled: {}
+  config:
+    enabled: true
+    alwaysInspect: true
+    unknownModelPolicy: inspect
+    maxProjectionChars: 6000
+    maxTaskChars: 2000
+"#,
+        !multimodal_active,
+        yaml_quote(&config.vision_provider),
+        yaml_quote(&config.vision_model),
+        !multimodal_active,
+    ));
+    write_atomic(&profile.join("cordis.patch.yml"), patch.as_bytes())?;
+
+    // DSH owns the primary model configuration. Preserve settings written by
+    // its own UI and only merge DSH++'s dedicated multimodal provider.
+    let settings_path = home.join("settings.yaml");
+    let mut settings = fs::read(&settings_path)
+        .ok()
+        .and_then(|bytes| serde_yaml::from_slice::<serde_yaml::Mapping>(&bytes).ok())
+        .unwrap_or_default();
+    if !config.vision_provider.is_empty()
+        && !config.vision_model.is_empty()
+        && !config.vision_base_url.is_empty()
+    {
+        let vision_yaml = format!(
+            r#"
+llm-pi-ai:
+  providers:
+    {}:
+      displayName: DSH++ Vision
+      apiKeyEnv: DSHPLUSPLUS_VISION_API_KEY
+      api: {}
+      baseURL: {}
+      defaultInput: [text, image]
+      models:
+        - id: {}
+          name: {}
+          input: [text, image]
+"#,
+            config.vision_provider,
+            yaml_quote(&config.vision_api),
+            yaml_quote(&config.vision_base_url),
+            yaml_quote(&config.vision_model),
+            yaml_quote(&config.vision_model),
+        );
+        let vision_root: serde_yaml::Mapping =
+            serde_yaml::from_str(&vision_yaml).map_err(|error| error.to_string())?;
+        let llm_key = serde_yaml::Value::String("llm-pi-ai".into());
+        let providers_key = serde_yaml::Value::String("providers".into());
+        let provider_key = serde_yaml::Value::String(config.vision_provider.clone());
+        let provider_value = vision_root
+            .get(&llm_key)
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|llm| llm.get(&providers_key))
+            .and_then(serde_yaml::Value::as_mapping)
+            .and_then(|providers| providers.get(&provider_key))
+            .cloned()
+            .ok_or("无法生成多模态 Provider 配置")?;
+        let llm_value = settings
+            .entry(llm_key)
+            .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+        if !llm_value.is_mapping() {
+            *llm_value = serde_yaml::Value::Mapping(Default::default());
+        }
+        let llm = llm_value
+            .as_mapping_mut()
+            .ok_or("DSH llm-pi-ai 配置格式无效")?;
+        let providers_value = llm
+            .entry(providers_key)
+            .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+        if !providers_value.is_mapping() {
+            *providers_value = serde_yaml::Value::Mapping(Default::default());
+        }
+        providers_value
+            .as_mapping_mut()
+            .ok_or("DSH Provider 配置格式无效")?
+            .insert(provider_key, provider_value);
+    }
+
+    // 主模型图片适配（解除 DSH 发送端拦截）：
+    // llm-deepseek 的 wire 路由硬编码只读文本（inputModalities=['text']），
+    // DSH 的 prompt API 会据此拒绝图片附件，multimodal-router 永远收不到图。
+    // 这里把主模型平移到同 baseURL 的 llm-pi-ai provider（deepseek-plus），
+    // 声明 [text, image] 解除发送限制；multimodal-router 以 alwaysInspect
+    // 无条件投影，保证图片在进入 DeepSeek API 前已被替换为文本观察。
+    // llm-deepseek 的配置平铺在 `llm-deepseek` 根（settingsNs，provider 固定
+    // 为 deepseek-official）；兼容 `llm-deepseek.providers.<id>` 变体。
+    // 若 settings 中没有 llm-deepseek 段（用户主模型走 dsh 内置默认，从未
+    // 显式配置过），则用 dsh-llm-deepseek 的内置默认兜底（apiKeyEnv
+    // DEEPSEEK_API_KEY、baseURL https://api.deepseek.com、默认模型目录），
+    // 保证这类用户也能获得图片适配而非发图被拒。
+    let deepseek_root = settings
+        .get("llm-deepseek")
+        .and_then(serde_yaml::Value::as_mapping)
+        .cloned();
+    let (primary_provider_id, primary_provider_config) = deepseek_root
+        .as_ref()
+        .and_then(|root| root.get("providers"))
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|providers| providers.iter().next())
+        .map(|(id, config)| (id.clone(), config.clone()))
+        .unwrap_or_else(|| {
+            (
+                serde_yaml::Value::String("deepseek-official".into()),
+                deepseek_root
+                    .clone()
+                    .map(serde_yaml::Value::Mapping)
+                    .unwrap_or_else(|| {
+                        serde_yaml::Value::Mapping(default_deepseek_primary_config())
+                    }),
+            )
+        });
+    let base_url = primary_provider_config
+        .get("baseURL")
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let api_key_env = primary_provider_config
+        .get("apiKeyEnv")
+        .and_then(serde_yaml::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let models = primary_provider_config
+        .get("models")
+        .and_then(serde_yaml::Value::as_sequence)
+        .cloned();
+    if !base_url.is_empty()
+        && !api_key_env.is_empty()
+        && models.as_ref().is_some_and(|models| !models.is_empty())
+    {
+        let mut plus_models = Vec::new();
+        if let Some(models) = &models {
+            for model in models {
+                let id = model
+                    .get("id")
+                    .and_then(serde_yaml::Value::as_str)
+                    .unwrap_or_default();
+                if id.is_empty() {
+                    continue;
+                }
+                let mut entry = serde_yaml::Mapping::new();
+                entry.insert("id".into(), serde_yaml::Value::String(id.into()));
+                if let Some(name) = model.get("name").and_then(serde_yaml::Value::as_str) {
+                    entry.insert("name".into(), serde_yaml::Value::String(name.into()));
+                }
+                entry.insert(
+                    "input".into(),
+                    serde_yaml::Value::Sequence(vec![
+                        serde_yaml::Value::String("text".into()),
+                        serde_yaml::Value::String("image".into()),
+                    ]),
+                );
+                for field in ["contextWindow", "maxTokens"] {
+                    if let Some(value) = model.get(field).cloned() {
+                        entry.insert(field.into(), value);
+                    }
+                }
+                // llm-deepseek 的默认容量：缺省时显式补上，避免 pi-ai 的
+                // 溢出检测按小默认值误判（曾导致大会话每轮报 context overflow）。
+                if entry.get("contextWindow").is_none() {
+                    entry.insert(
+                        "contextWindow".into(),
+                        serde_yaml::Value::Number(1_000_000u64.into()),
+                    );
+                }
+                if entry.get("maxTokens").is_none() {
+                    entry.insert(
+                        "maxTokens".into(),
+                        serde_yaml::Value::Number(256_000u64.into()),
+                    );
+                }
+                // 对齐 llm-deepseek 的思考档位：off/high/max（wire 值同
+                // DeepSeek reasoning_effort；off 用 null 表示“省略”）。
+                entry.insert(
+                    "reasoningEfforts".into(),
+                    serde_yaml::Value::Mapping(
+                        [
+                            ("off", serde_yaml::Value::Null),
+                            ("high", serde_yaml::Value::String("high".into())),
+                            ("max", serde_yaml::Value::String("max".into())),
+                        ]
+                        .into_iter()
+                        .map(|(key, value)| (serde_yaml::Value::String(key.into()), value))
+                        .collect(),
+                    ),
+                );
+                plus_models.push(serde_yaml::Value::Mapping(entry));
+            }
+        }
+        let models_yaml =
+            serde_yaml::to_string(&serde_yaml::Value::Sequence(plus_models)).unwrap_or_default();
+        let models_indented = models_yaml
+            .lines()
+            .map(|line| format!("      {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let plus_yaml = format!(
+            "llm-pi-ai:\n  providers:\n    deepseek-plus:\n      displayName: DeepSeek · DSH++ 图片适配\n      apiKeyEnv: {}\n      api: openai-completions\n      baseURL: {}\n      defaultInput: [text, image]\n      models:\n{}\n",
+            yaml_quote(&api_key_env),
+            yaml_quote(&base_url),
+            models_indented,
+        );
+        if let Ok(plus_root) = serde_yaml::from_str::<serde_yaml::Mapping>(&plus_yaml) {
+            let llm_key = serde_yaml::Value::String("llm-pi-ai".into());
+            let providers_key = serde_yaml::Value::String("providers".into());
+            let plus_provider = plus_root
+                .get(&llm_key)
+                .and_then(serde_yaml::Value::as_mapping)
+                .and_then(|llm| llm.get(&providers_key))
+                .and_then(serde_yaml::Value::as_mapping)
+                .and_then(|providers| providers.get("deepseek-plus"))
+                .cloned();
+            if let Some(plus_provider) = plus_provider {
+                let llm_value = settings
+                    .entry(llm_key.clone())
+                    .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+                if let Some(llm) = llm_value.as_mapping_mut() {
+                    let providers_value = llm
+                        .entry(providers_key.clone())
+                        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+                    if let Some(providers) = providers_value.as_mapping_mut() {
+                        providers.insert(
+                            serde_yaml::Value::String("deepseek-plus".into()),
+                            plus_provider,
+                        );
+                    }
+                }
+                // 默认模型选择平移到 deepseek-plus（模型名不变）。settings 中
+                // 没有 agent-default-model 段时（新用户从未配置过模型）创建
+                // 默认段，让图片适配对新用户开箱即用。
+                if let Some(default_model) = settings
+                    .get_mut("agent-default-model")
+                    .and_then(serde_yaml::Value::as_mapping_mut)
+                {
+                    let current_provider = default_model
+                        .get("provider")
+                        .and_then(serde_yaml::Value::as_str)
+                        .unwrap_or_default();
+                    if current_provider == primary_provider_id.as_str().unwrap_or_default() {
+                        default_model.insert(
+                            "provider".into(),
+                            serde_yaml::Value::String("deepseek-plus".into()),
+                        );
+                    }
+                } else if !settings.contains_key("agent-default-model") {
+                    let mut default_model = serde_yaml::Mapping::new();
+                    default_model.insert(
+                        serde_yaml::Value::String("provider".into()),
+                        serde_yaml::Value::String("deepseek-plus".into()),
+                    );
+                    default_model.insert(
+                        serde_yaml::Value::String("model".into()),
+                        serde_yaml::Value::String("deepseek-v4-flash".into()),
+                    );
+                    settings.insert(
+                        serde_yaml::Value::String("agent-default-model".into()),
+                        serde_yaml::Value::Mapping(default_model),
+                    );
+                }
+            }
+        }
+    }
+    let serialized = serde_yaml::to_string(&settings).map_err(|error| error.to_string())?;
+    write_atomic(&settings_path, serialized.as_bytes())?;
+    Ok(home.to_path_buf())
+}
+
+fn port_open(host: &str, port: u16) -> bool {
+    (host, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut items| items.next())
+        .and_then(|address| TcpStream::connect_timeout(&address, Duration::from_millis(180)).ok())
+        .is_some()
+}
+
+fn is_dsh_endpoint(host: &str, port: u16) -> bool {
+    let url = format!("http://{host}:{port}");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(3)))
+        .build()
+        .into();
+    agent
+        .get(&url)
+        .call()
+        .ok()
+        .and_then(|mut response| response.body_mut().read_to_string().ok())
+        .is_some_and(|body| body.contains("DeepSeek Harness") || body.contains("deepseek-harness"))
+}
+
+/// 与七项能力相关的 MCA Provider（按 id 关键字匹配，供工具级健康展示）。
+const KEY_MCA_PROVIDERS: &[&str] = &[
+    "wheel.image-metadata",
+    "specialist.easyocr",
+    "builtin.windows-ocr",
+    "pipeline.media-vision",
+    "pipeline.media-local",
+    "specialist.whisper",
+    "specialist.pyannote-diarization",
+    "wheel.office-documents",
+    "wheel.web-collection",
+    "builtin.html",
+    "wheel.playwright-browser",
+    "wheel.yt-dlp-online-media",
+    "wheel.pyautogui-desktop",
+];
+
+/// 读取 MCA 关键 Provider 的工具级健康（UI 能力卡片展示）。失败返回空列表。
+fn fetch_mca_providers() -> Vec<McaProviderView> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(2)))
+        .build()
+        .into();
+    let Ok(body) = agent
+        .get("http://127.0.0.1:18765/api/providers")
+        .call()
+        .map(|mut response| response.body_mut().read_to_string())
+    else {
+        return Vec::new();
+    };
+    let Ok(body) = body else { return Vec::new() };
+    let Ok(providers) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return Vec::new();
+    };
+    let Some(providers) = providers.as_array() else {
+        return Vec::new();
+    };
+    providers
+        .iter()
+        .filter_map(|provider| {
+            let provider_id = provider
+                .get("provider_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !KEY_MCA_PROVIDERS.contains(&provider_id) {
+                return None;
+            }
+            let health = provider.get("health");
+            Some(McaProviderView {
+                provider_id: provider_id.to_string(),
+                enabled: provider
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                available: health
+                    .and_then(|h| h.get("available"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                detail: health
+                    .and_then(|h| h.get("detail"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// 读取 MCA deepseek-tui 路由的实时能力与健康状态（UI 动态化能力开关用）。
+/// MCA 未运行或查询失败时返回 None（调用方容错）。
+fn fetch_mca_route() -> Option<McaRouteView> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(2)))
+        .build()
+        .into();
+    let body = agent
+        .get("http://127.0.0.1:18765/api/agent-routes")
+        .call()
+        .ok()?
+        .body_mut()
+        .read_to_string()
+        .ok()?;
+    let routes: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let routes = routes.as_array()?;
+    let route = routes.iter().find(|route| {
+        route.get("agent_id").and_then(serde_json::Value::as_str) == Some("deepseek-tui")
+    })?;
+    let strings = |value: Option<&serde_json::Value>| -> Vec<String> {
+        value
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // 首个阻塞层的具体原因（如“未检测到 Agent 命令”），无阻塞层时取总评。
+    let health_detail = route
+        .get("health")
+        .and_then(|health| health.get("layers"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|layers| {
+            layers
+                .iter()
+                .find(|layer| layer.get("blocking").and_then(serde_json::Value::as_bool) == Some(true))
+                .or_else(|| layers.first())
+        })
+        .and_then(|layer| layer.get("detail"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Some(McaRouteView {
+        agent_id: route
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        route_available: route
+            .get("route_available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        capabilities: strings(route.get("capabilities")),
+        available_capabilities: strings(route.get("available_capabilities")),
+        computer_provider_enabled: route
+            .get("computer_provider_enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        health: route
+            .get("health")
+            .and_then(|health| health.get("overall"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        health_detail,
+    })
+}
+
+fn mca_capabilities(config: &StoredConfig) -> Vec<&'static str> {
+    let mut capabilities = Vec::new();
+    if config.mca_image {
+        capabilities.push("image");
+    }
+    if config.mca_video {
+        capabilities.push("video");
+    }
+    if config.mca_audio {
+        capabilities.push("audio");
+    }
+    if config.mca_document {
+        capabilities.push("document");
+    }
+    if config.mca_web {
+        capabilities.push("web");
+    }
+    if config.mca_computer_observe {
+        capabilities.push("computer.observe");
+    }
+    if config.mca_computer_act {
+        capabilities.push("computer.act");
+    }
+    capabilities
+}
+
+fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if port_open(host, port) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(180));
+    }
+    false
+}
+
+fn wait_for_dsh(host: &str, port: u16, timeout: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if is_dsh_endpoint(host, port) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    false
+}
+
+fn log_files(runtime: &RuntimePaths, name: &str) -> Result<(File, File), String> {
+    let logs = runtime.data_root.join("logs");
+    fs::create_dir_all(&logs).map_err(|error| error.to_string())?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logs.join(format!("{name}.log")))
+        .map_err(|error| error.to_string())?;
+    let error = file.try_clone().map_err(|error| error.to_string())?;
+    Ok((file, error))
+}
+
+#[cfg(target_os = "windows")]
+fn hide_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x08000000 | 0x00000200);
+}
+#[cfg(not(target_os = "windows"))]
+fn hide_console(_: &mut Command) {}
+
+#[cfg(target_os = "windows")]
+fn assign_kill_on_close_job(child: &Child) -> Option<isize> {
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+        information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &information as *const _ as _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        let assigned = AssignProcessToJobObject(job, child.as_raw_handle() as _);
+        if configured == 0 || assigned == 0 {
+            windows_sys::Win32::Foundation::CloseHandle(job);
+            return None;
+        }
+        Some(job as isize)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn assign_kill_on_close_job(_: &Child) -> Option<isize> {
+    None
+}
+
+fn configure_mca_route(
+    state: &AppState,
+    config: &StoredConfig,
+    reused: bool,
+) -> Result<(), String> {
+    let capabilities = if config.enable_mca {
+        mca_capabilities(config)
+    } else {
+        Vec::new()
+    };
+    let capability_count = capabilities.len();
+    let route_url = format!("http://127.0.0.1:{MCA_PORT}/api/agent-routes/deepseek-tui");
+    let route = json!({
+        "mode": if config.enable_mca && capability_count > 0 { "assist" } else { "off" },
+        "capabilities": capabilities,
+        "capability_release_enabled": false,
+        "allow_external": config.enable_mca && config.mca_web,
+        "model_provider": "deepseek",
+        "model_family": "deepseek",
+        "model_name": config.deepseek_model,
+        "computer_allowed_risk": "low",
+        "computer_require_confirmation": true,
+        "computer_access_mode": "ask"
+    });
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .into();
+    // 电脑能力需要 MCA 桌面自动化 Provider（默认禁用）：先启用它，否则
+    // MCA 会拒绝含 computer.* 能力的路由（400）。幂等，失败不致命——
+    // 若 Provider 真不可用，随后的路由 PUT 会走现有错误处理。
+    if capabilities.iter().any(|capability| capability.starts_with("computer.")) {
+        let provider_url = format!(
+            "http://127.0.0.1:{MCA_PORT}/api/providers/wheel.pyautogui-desktop/state"
+        );
+        let _ = agent.post(&provider_url).send_json(json!({ "enabled": true }));
+    }
+    if let Err(error) = agent.put(&route_url).send_json(route) {
+        let mut service = state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?;
+        if reused {
+            service.state = ServiceState::Error;
+            service.message =
+                format!("端口 {MCA_PORT} 不是可用的 MCA 服务，或能力配置不受支持：{error}");
+            return Err(service.message.clone());
+        }
+        service.state = ServiceState::Running;
+        service.message = format!("MCA 已启动，能力下发失败：{error}");
+        return Ok(());
+    }
+    let mut service = state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?;
+    service.state = ServiceState::Running;
+    service.message = if config.enable_mca {
+        format!("{capability_count} 项 MCA 能力已就绪")
+    } else {
+        "MCA 能力路由已关闭".into()
+    };
+    Ok(())
+}
+
+fn start_browser(state: &AppState, config: &StoredConfig) -> Result<(), String> {
+    if !config.enable_browser && !config.enable_chrome_use {
+        return Ok(());
+    }
+    let reused = port_open("127.0.0.1", BROWSER_PORT);
+    if !reused {
+        let gateway = state
+            .runtime
+            .browser_gateway
+            .as_ref()
+            .ok_or("未找到浏览器网关（runtime/browser/gateway.js）；请重新构建便携包")?;
+        let node = state.runtime.node.as_ref().ok_or("未找到 Node 运行时")?;
+        let (stdout, stderr) = log_files(&state.runtime, "browser")?;
+        let mut command = Command::new(node);
+        command
+            .arg(gateway)
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &BROWSER_PORT.to_string(),
+                "--data",
+            ])
+            .arg(&state.runtime.data_root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        hide_console(&mut command);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("无法启动浏览器网关：{error}"))?;
+        #[cfg(target_os = "windows")]
+        let job_handle = assign_kill_on_close_job(&child);
+        {
+            let mut service = state.browser.lock().map_err(|_| "浏览器状态锁已损坏")?;
+            service.child = Some(child);
+            #[cfg(target_os = "windows")]
+            {
+                service.job_handle = job_handle;
+            }
+            service.state = ServiceState::Starting;
+            service.message = "等待浏览器网关就绪".into();
+        }
+        if !wait_for_port("127.0.0.1", BROWSER_PORT, Duration::from_secs(15)) {
+            let mut service = state.browser.lock().map_err(|_| "浏览器状态锁已损坏")?;
+            service.state = ServiceState::Error;
+            service.message = "浏览器网关在 15 秒内没有就绪；请查看诊断日志".into();
+            return Err(service.message.clone());
+        }
+    } else {
+        let mut service = state.browser.lock().map_err(|_| "浏览器状态锁已损坏")?;
+        service.state = ServiceState::Starting;
+        service.message = format!("正在连接本机浏览器网关（端口 {BROWSER_PORT}）");
+    }
+    let mut service = state.browser.lock().map_err(|_| "浏览器状态锁已损坏")?;
+    service.state = ServiceState::Running;
+    // chromeUse 自动激活：幂等准备扩展 + Chrome 未运行时自动拉起。
+    service.message = if config.enable_chrome_use {
+        auto_activate_chrome_use(state)
+    } else {
+        "浏览器能力已就绪".into()
+    };
+    Ok(())
+}
+
+/// Locate the Chrome extension payload next to the browser gateway script.
+fn extension_source(runtime: &RuntimePaths) -> Option<PathBuf> {
+    let gateway_dir = runtime.browser_gateway.as_ref()?.parent()?;
+    let candidates = [
+        gateway_dir.join("extension"),
+        gateway_dir.join("../extension"),
+        gateway_dir.join("../../extension"),
+    ];
+    candidates
+        .into_iter()
+        .find(|path| path.join("manifest.json").is_file())
+}
+
+/// 幂等准备 chromeUse 扩展：写入扩展文件、native-host launcher 与注册表。
+/// 返回扩展目录。启动流程与“安装 Chrome 扩展”按钮共用。
+fn prepare_chrome_extension(state: &AppState) -> Result<PathBuf, String> {
+    let runtime = &state.runtime;
+    let source =
+        extension_source(runtime).ok_or("未找到 Chrome 扩展资源（runtime/browser/extension）")?;
+    let destination = runtime.data_root.join("browser-extension");
+    fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
+    for name in ["manifest.json", "background.js", "content.js"] {
+        let from = source.join(name);
+        if !from.is_file() {
+            return Err(format!("扩展资源缺失：{name}"));
+        }
+        fs::copy(&from, destination.join(name)).map_err(|error| error.to_string())?;
+    }
+
+    // Native messaging host wrapper (.cmd sets the gateway URL, then runs node).
+    let node = runtime.node.as_ref().ok_or("未找到 Node 运行时")?;
+    let host_script = destination.join("native-host.mjs");
+    let gateway_dir = runtime
+        .browser_gateway
+        .as_ref()
+        .and_then(|path| path.parent())
+        .unwrap_or(source.parent().unwrap_or(&source));
+    // 兼容两种部署布局：runtime/browser/native-host/native-host.mjs（标准）与
+    // runtime/browser/native-host.mjs（旧布局）。
+    let source_host = [
+        source
+            .parent()
+            .unwrap_or(&source)
+            .join("native-host/native-host.mjs"),
+        gateway_dir.join("native-host/native-host.mjs"),
+        gateway_dir.join("native-host.mjs"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .ok_or("native-host.mjs 缺失（runtime/browser/native-host/ 下）")?;
+    fs::copy(&source_host, &host_script).map_err(|error| error.to_string())?;
+    // Host launcher：优先用编译好的 native-host-launcher.exe（Chrome 直接
+    // CreateProcess 可执行文件最可靠；.cmd 在部分 Chrome 版本不可靠）。
+    // launcher 以自身位置解析 node 与脚本的相对路径，便携包可随处移动。
+    let launcher_source = [
+        gateway_dir.join("native-host-launcher.exe"),
+        runtime
+            .browser_gateway
+            .as_ref()
+            .and_then(|path| path.parent())
+            .unwrap_or(gateway_dir)
+            .join("native-host-launcher.exe"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file());
+    let mut host_binary = destination.join("native-host.cmd");
+    let cmd = format!(
+        "@echo off\r\nset DSHPLUSPLUS_GATEWAY=http://127.0.0.1:{BROWSER_PORT}\r\n\"{}\" \"{}\" %*\r\n",
+        path_string(node),
+        path_string(&host_script),
+    );
+    if let Some(launcher) = launcher_source {
+        let launcher_dest = destination.join("native-host-launcher.exe");
+        fs::copy(&launcher, &launcher_dest).map_err(|error| error.to_string())?;
+        host_binary = launcher_dest;
+    } else {
+        write_atomic(&destination.join("native-host.cmd"), cmd.as_bytes())?;
+    }
+
+    // Host manifest registered under HKCU NativeMessagingHosts.
+    let manifest_path = destination.join("host-manifest.json");
+    let manifest = json!({
+        "name": "com.dshplusplus.browser",
+        "description": "DSH++ Browser Control native messaging host",
+        "path": path_string(&host_binary),
+        "type": "stdio",
+        "allowed_origins": ["chrome-extension://kikoigbglcakhdeknllbinnaepdaoofh/"]
+    });
+    write_atomic(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest)
+            .map_err(|error| error.to_string())?
+            .as_bytes(),
+    )?;
+    let registration = Command::new("reg")
+        .args([
+            "add",
+            r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.dshplusplus.browser",
+            "/ve",
+            "/d",
+            &path_string(&manifest_path),
+            "/f",
+        ])
+        .output()
+        .map_err(|error| format!("注册 Native Messaging 主机失败：{error}"))?;
+    if !registration.status.success() {
+        return Err(format!(
+            "注册表写入失败：{}",
+            String::from_utf8_lossy(&registration.stderr)
+        ));
+    }
+    Ok(destination)
+}
+
+/// 查找本机 Chrome 可执行文件。
+fn find_chrome_exe() -> Option<PathBuf> {
+    std::env::var_os("DSHPLUSPLUS_CHROME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            [
+                PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+                PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default())
+                    .join(r"Google\Chrome\Application\chrome.exe"),
+            ]
+            .into_iter()
+            .find(|path| path.is_file())
+        })
+}
+
+/// chromeUse 自动激活：幂等准备扩展；Chrome 未运行时自动以
+/// --load-extension 拉起（Chrome 137 以下自动生效；137+ 该参数被禁用，
+/// 扩展会持久保留已加载状态，首次仍需要一次手动加载）。返回给用户的状态文本。
+fn auto_activate_chrome_use(state: &AppState) -> String {
+    // 只做幂等准备（扩展文件 + launcher + 注册表），不自动启动 Chrome：
+    // 用户自己打开 Chrome 时，已加载的扩展会自动连接。
+    match prepare_chrome_extension(state) {
+        Ok(_) => "chromeUse：扩展已就绪，打开 Chrome 后自动连接".into(),
+        Err(error) => format!("chromeUse 扩展准备失败：{error}"),
+    }
+}
+
+/// 更新检查结果（本地暂存 + 可选远程源）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheckResult {
+    available: bool,
+    version: Option<String>,
+    message: String,
+}
+
+/// 检查更新：优先检测 exe 同目录的 DSHPlusPlus.update.exe（本地暂存，
+/// 配合"更新到新版.cmd"使用）；配置了远程更新源（update_url，JSON
+/// {"version":"x.y.z","url":"https://…/DSHPlusPlus.update.exe"}）时，
+/// 对比版本并下载新 exe 到暂存位置。
+#[tauri::command]
+fn check_for_update(app: tauri::AppHandle) -> Result<UpdateCheckResult, String> {
+    use std::io::Read;
+    let state = app.state::<AppState>();
+    let config = state.config.lock().map_err(|_| "配置状态锁已损坏")?.clone();
+    let exe_dir = std::env::current_exe()
+        .map_err(|error| error.to_string())?
+        .parent()
+        .ok_or("无法解析程序目录")?
+        .to_path_buf();
+    let staged = exe_dir.join("DSHPlusPlus.update.exe");
+
+    // 1) 远程更新源（配置了才用）。
+    let remote_url = config.update_url.trim().to_string();
+    if !remote_url.is_empty() {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(20)))
+            .build()
+            .into();
+        let body = agent
+            .get(&remote_url)
+            .call()
+            .map_err(|error| format!("获取更新清单失败：{error}"))?
+            .body_mut()
+            .read_to_string()
+            .map_err(|error| error.to_string())?;
+        let manifest: serde_json::Value =
+            serde_json::from_str(&body).map_err(|error| format!("更新清单格式无效：{error}"))?;
+        let remote_version = manifest
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let download_url = manifest
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if remote_version.is_empty() || download_url.is_empty() {
+            return Err("更新清单缺少 version 或 url 字段".into());
+        }
+        if remote_version != VERSION {
+            let response = agent
+                .get(download_url)
+                .call()
+                .map_err(|error| format!("下载更新失败：{error}"))?;
+            let mut bytes = Vec::new();
+            let mut reader = response.into_body().into_reader();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = reader
+                    .read(&mut buffer)
+                    .map_err(|error| format!("下载更新失败：{error}"))?;
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            write_atomic(&staged, &bytes)?;
+            return Ok(UpdateCheckResult {
+                available: true,
+                version: Some(remote_version.into()),
+                message: format!("发现新版本 {remote_version}，已下载。请退出后运行“更新到新版.cmd”。"),
+            });
+        }
+        return Ok(UpdateCheckResult {
+            available: false,
+            version: None,
+            message: format!("已是最新版本（{VERSION}）。"),
+        });
+    }
+
+    // 2) 本地暂存检测。
+    if staged.is_file() {
+        return Ok(UpdateCheckResult {
+            available: true,
+            version: None,
+            message: "发现本地暂存的新版本（DSHPlusPlus.update.exe）。请退出后运行“更新到新版.cmd”。".into(),
+        });
+    }
+    Ok(UpdateCheckResult {
+        available: false,
+        version: None,
+        message: format!("当前已是最新版本（{VERSION}）。未发现待安装更新。"),
+    })
+}
+
+#[tauri::command]
+fn install_chrome_extension(state: State<'_, AppState>) -> Result<String, String> {
+    let destination = prepare_chrome_extension(&state)?;
+    let mut hint = String::from(
+        "Chrome 扩展已安装：\n1. 若 Chrome 正在运行，请完全退出后，用下面的命令重新启动 Chrome：\n",
+    );
+    let chrome = find_chrome_exe();
+    if let Some(chrome) = chrome {
+        let launch = format!(
+            "\"{}\" --load-extension=\"{}\"\n2. 已打开的页面请按 F5 刷新后再使用 chromeUse。\n3. Chrome 137+ 的 --load-extension 可能不生效：请打开 chrome://extensions，开启“开发者模式”，点“加载已解压的扩展程序”选择：\n{}",
+            path_string(&chrome),
+            path_string(&destination),
+            path_string(&destination)
+        );
+        hint.push_str(&launch);
+        // Only auto-launch when no Chrome instance is running (loading a new
+        // extension requires a fresh process).
+        let chrome_running = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq chrome.exe", "/NH"])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).contains("chrome.exe"))
+            .unwrap_or(false);
+        if !chrome_running {
+            let _ = std::process::Command::new(&chrome)
+                .arg(format!("--load-extension={}", path_string(&destination)))
+                .spawn();
+            hint.push_str("\n3. 已为你启动 Chrome（含扩展）。");
+        }
+    } else {
+        hint.push_str("未找到 Chrome；请手动安装扩展后使用。");
+    }
+    Ok(hint)
+}
+
+fn start_mca(state: &AppState, config: &StoredConfig) -> Result<(), String> {
+    if !config.enable_mca {
+        return Ok(());
+    }
+    let reused = port_open("127.0.0.1", MCA_PORT);
+    if !reused {
+        let binary = state
+            .runtime
+            .mca
+            .as_ref()
+            .ok_or("未找到 MCA Sidecar；请重新构建 Full 便携包，或关闭 MCA")?;
+        let data = state.runtime.data_root.join("mca-data");
+        fs::create_dir_all(&data).map_err(|error| error.to_string())?;
+        let (stdout, stderr) = log_files(&state.runtime, "mca")?;
+        let mut command = Command::new(binary);
+        command
+            .args([
+                "serve",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &MCA_PORT.to_string(),
+                "--data",
+            ])
+            .arg(&data)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
+        command.env("MCA_DATA_ROOT", &data);
+        // 跟随系统代理：MCA 的 httpx 请求（网页/在线媒体）与 yt-dlp 子进程
+        // 都读取 HTTP_PROXY/HTTPS_PROXY；NO_PROXY 豁免本机回环地址。
+        for (name, value) in system_proxy_env() {
+            command.env(name, value);
+        }
+        hide_console(&mut command);
+        let child = command
+            .spawn()
+            .map_err(|error| format!("无法启动 MCA：{error}"))?;
+        #[cfg(target_os = "windows")]
+        let job_handle = assign_kill_on_close_job(&child);
+        {
+            let mut service = state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?;
+            service.child = Some(child);
+            #[cfg(target_os = "windows")]
+            {
+                service.job_handle = job_handle;
+            }
+            service.state = ServiceState::Starting;
+            service.message = "等待 MCA API 就绪".into();
+        }
+        if !wait_for_port("127.0.0.1", MCA_PORT, Duration::from_secs(18)) {
+            let mut service = state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?;
+            service.state = ServiceState::Error;
+            service.message = "MCA 在 18 秒内没有就绪；请查看诊断日志".into();
+            return Err(service.message.clone());
+        }
+    } else {
+        let mut service = state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?;
+        service.state = ServiceState::Starting;
+        service.message = format!("正在连接本机 MCA（端口 {MCA_PORT}）");
+    }
+    configure_mca_route(state, config, reused)
+}
+
+fn random_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos}")
+}
+
+/// 把旧会话的模型选择从 llm-deepseek 家族平移到 deepseek-plus（图片适配）。
+/// DSH 的 prompt 校验读取的是“会话级”模型选择；旧会话持久化的
+/// deepseek-official 会继续拦截图片附件。该函数幂等：只处理
+/// current.provider 属于 deepseek-official/deepseek 的会话，其余跳过。
+fn migrate_sessions_to_plus(host: &str, port: u16) {
+    let base = format!("http://{host}:{port}/api/");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(8)))
+        .build()
+        .into();
+    let rpc = |method: &str, payload: serde_json::Value| -> Option<serde_json::Value> {
+        let body = json!({
+            "type": "client-request",
+            "rpcId": format!("dshplusplus-{}-{}", std::process::id(), random_suffix()),
+            "method": method,
+            "payload": payload,
+        });
+        let mut response = agent
+            .post(&format!("{base}{method}"))
+            .send_json(body)
+            .ok()?;
+        let text = response.body_mut().read_to_string().ok()?;
+        let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let result = parsed.get("result")?.clone();
+        if result.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return None;
+        }
+        Some(result)
+    };
+    let Some(list) = rpc("session.list", json!({})) else {
+        return;
+    };
+    let Some(items) = list
+        .get("value")
+        .and_then(|value| value.get("items"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for item in items {
+        let Some(session_id) = item.get("sessionId").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(models) = rpc("session.models", json!({ "sessionId": session_id })) else {
+            continue;
+        };
+        let Some(current) = models.get("value").and_then(|value| value.get("current")) else {
+            continue;
+        };
+        let provider = current
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if provider != "deepseek-official" && provider != "deepseek" {
+            continue;
+        }
+        let model = current
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if model.is_empty() {
+            continue;
+        }
+        let mut payload = json!({
+            "sessionId": session_id,
+            "provider": "deepseek-plus",
+            "model": model,
+        });
+        if let Some(effort) = current
+            .get("reasoningEffort")
+            .and_then(serde_json::Value::as_str)
+        {
+            payload["reasoningEffort"] = serde_json::Value::String(effort.into());
+        }
+        rpc("session.selectModel", payload);
+    }
+}
+
+fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
+    if port_open(&config.dsh_host, config.dsh_port) {
+        if is_dsh_endpoint(&config.dsh_host, config.dsh_port) {
+            let mut service = state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?;
+            service.state = ServiceState::Running;
+            service.message = format!("已连接现有 DSH · {}:{}", config.dsh_host, config.dsh_port);
+            return Ok(());
+        }
+        return Err(format!(
+            "端口 {} 已被其他程序占用，且不是 DSH",
+            config.dsh_port
+        ));
+    }
+    let node = state.runtime.node.as_ref().ok_or("未找到 Node 运行时")?;
+    let cli = state.runtime.dsh_cli.as_ref().ok_or("未找到 DSH 运行时")?;
+    // 使用标准 home 时，把旧便携 home（.portable/dsh-home）的数据一次性并入
+    // 标准 home（幂等；失败不阻塞启动，见诊断日志）。
+    if let Err(error) = migrate_portable_home_data(&state.runtime) {
+        eprintln!("[dshplusplus] 便携数据迁移失败（可忽略）：{error}");
+    }
+    let home = effective_dsh_home(&state.runtime);
+    materialize_dsh_config(&state.runtime, config, &home)?;
+    let workspace = if config.workspace.is_empty() {
+        state.runtime.data_root.clone()
+    } else {
+        PathBuf::from(&config.workspace)
+    };
+    let (stdout, stderr) = log_files(&state.runtime, "dsh")?;
+    let mut command = Command::new(node);
+    command
+        .arg(cli)
+        .args([
+            "--profile",
+            "dshplusplus",
+            "--host",
+            &config.dsh_host,
+            "--port",
+            &config.dsh_port.to_string(),
+        ])
+        .current_dir(workspace)
+        .env("DSH_HOME", &home)
+        .env("DSH_TELEMETRY_DISABLED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    if let Some(secret) = config.vision_secret.as_deref() {
+        command.env("DSHPLUSPLUS_VISION_API_KEY", unprotect_secret(secret)?);
+    }
+    hide_console(&mut command);
+    let child = command
+        .spawn()
+        .map_err(|error| format!("无法启动 DSH：{error}"))?;
+    #[cfg(target_os = "windows")]
+    let job_handle = assign_kill_on_close_job(&child);
+    {
+        let mut service = state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?;
+        service.child = Some(child);
+        #[cfg(target_os = "windows")]
+        {
+            service.job_handle = job_handle;
+        }
+        service.state = ServiceState::Starting;
+        service.message = "正在组合 DSH++ Profile".into();
+    }
+    if !wait_for_dsh(&config.dsh_host, config.dsh_port, Duration::from_secs(25)) {
+        let mut service = state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?;
+        service.refresh(&config.dsh_host, config.dsh_port);
+        if port_open(&config.dsh_host, config.dsh_port) {
+            service.state = ServiceState::Error;
+            service.message = format!("端口 {} 已监听，但返回的不是 DSH 页面", config.dsh_port);
+        } else if !matches!(service.state, ServiceState::Error) {
+            service.state = ServiceState::Error;
+            service.message = "DSH 在 25 秒内没有就绪；请查看诊断日志".into();
+        }
+        return Err(service.message.clone());
+    }
+    let mut service = state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?;
+    service.state = ServiceState::Running;
+    service.message = format!(
+        "DSH++ Profile · PID {}",
+        service.child.as_ref().map(Child::id).unwrap_or(0)
+    );
+    Ok(())
+}
+
+fn snapshot(state: &AppState) -> Result<AppSnapshot, String> {
+    let config = state.config.lock().map_err(|_| "配置状态锁已损坏")?.clone();
+    let mut dsh = state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?;
+    let mut mca = state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?;
+    let mut browser = state.browser.lock().map_err(|_| "浏览器状态锁已损坏")?;
+    dsh.refresh(&config.dsh_host, config.dsh_port);
+    mca.refresh("127.0.0.1", MCA_PORT);
+    browser.refresh("127.0.0.1", BROWSER_PORT);
+    // MCA 运行时读取 deepseek-tui 路由能力/健康（供 UI 动态化开关）。
+    let mca_route = if matches!(mca.state, ServiceState::Running) && config.enable_mca {
+        fetch_mca_route()
+    } else {
+        None
+    };
+    // MCA 工具级健康（能力卡片展示）。
+    let mca_providers = if matches!(mca.state, ServiceState::Running) && config.enable_mca {
+        fetch_mca_providers()
+    } else {
+        Vec::new()
+    };
+    Ok(AppSnapshot {
+        version: VERSION,
+        config: ConfigView::from(&config),
+        runtime: RuntimeInfo {
+            portable: state.runtime.portable,
+            data_root: path_string(&state.runtime.data_root),
+            dsh_home: Some(path_string(&effective_dsh_home(&state.runtime))),
+            dsh_cli: state.runtime.dsh_cli.as_deref().map(path_string),
+            node_binary: state.runtime.node.as_deref().map(path_string),
+            mca_binary: state.runtime.mca.as_deref().map(path_string),
+            browser_gateway: state.runtime.browser_gateway.as_deref().map(path_string),
+        },
+        dsh_state: dsh.state,
+        dsh_url: format!("http://{}:{}", config.dsh_host, config.dsh_port),
+        dsh_pid: dsh.child.as_ref().map(Child::id),
+        dsh_message: dsh.message.clone(),
+        mca_state: mca.state,
+        mca_url: config
+            .enable_mca
+            .then(|| format!("http://127.0.0.1:{MCA_PORT}")),
+        mca_pid: mca.child.as_ref().map(Child::id),
+        mca_message: if !config.enable_mca {
+            "已在配置中关闭".into()
+        } else {
+            mca.message.clone()
+        },
+        mca_route,
+        mca_providers,
+        browser_state: browser.state,
+        browser_pid: browser.child.as_ref().map(Child::id),
+        browser_message: if !config.enable_browser && !config.enable_chrome_use {
+            "已在配置中关闭".into()
+        } else {
+            browser.message.clone()
+        },
+    })
+}
+
+#[tauri::command]
+fn get_snapshot(app: tauri::AppHandle) -> Result<AppSnapshot, String> {
+    let state = app.state::<AppState>();
+    let data = snapshot(&state)?;
+    sync_dsh_window(&app, data.dsh_state);
+    Ok(data)
+}
+
+#[tauri::command]
+fn refresh_status(app: tauri::AppHandle) -> Result<AppSnapshot, String> {
+    let state = app.state::<AppState>();
+    let data = snapshot(&state)?;
+    sync_dsh_window(&app, data.dsh_state);
+    Ok(data)
+}
+
+#[tauri::command]
+fn save_config(input: ConfigInput, app: tauri::AppHandle) -> Result<AppSnapshot, String> {
+    let state = app.state::<AppState>();
+    validate_config(&input)?;
+    let mut current = state.config.lock().map_err(|_| "配置状态锁已损坏")?;
+    let deepseek_secret = match input
+        .deepseek_api_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => Some(protect_secret(value)?),
+        None => current.deepseek_secret.clone(),
+    };
+    let vision_secret = match input
+        .vision_api_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => Some(protect_secret(value)?),
+        None => current.vision_secret.clone(),
+    };
+    *current = StoredConfig {
+        dsh_host: input.dsh_host,
+        dsh_port: input.dsh_port,
+        workspace: input.workspace,
+        update_url: input.update_url,
+        auto_start_dsh: input.auto_start_dsh,
+        auto_open_dsh_window: input.auto_open_dsh_window,
+        enable_mca: input.enable_mca,
+        enable_browser: input.enable_browser,
+        enable_chrome_use: input.enable_chrome_use,
+        mca_image: input.mca_image,
+        mca_video: input.mca_video,
+        mca_audio: input.mca_audio,
+        mca_document: input.mca_document,
+        mca_web: input.mca_web,
+        mca_computer_observe: input.mca_computer_observe,
+        mca_computer_act: input.mca_computer_act,
+        deepseek_base_url: input.deepseek_base_url,
+        deepseek_model: input.deepseek_model,
+        deepseek_secret,
+        vision_provider: input.vision_provider,
+        vision_base_url: input.vision_base_url,
+        vision_model: input.vision_model,
+        vision_api: input.vision_api,
+        vision_secret,
+        enable_multimodal: input.enable_multimodal,
+    };
+    let serialized = serde_json::to_vec_pretty(&*current).map_err(|error| error.to_string())?;
+    write_atomic(&config_path(&state.runtime), &serialized)?;
+    let home = effective_dsh_home(&state.runtime);
+    materialize_dsh_config(&state.runtime, &current, &home)?;
+    let updated = current.clone();
+    drop(current);
+    if port_open("127.0.0.1", MCA_PORT) {
+        let _ = configure_mca_route(&state, &updated, true);
+    }
+    // 浏览器网关：开关打开且未运行时拉起；全部关闭时停止。
+    let browser_should_run = updated.enable_browser || updated.enable_chrome_use;
+    let browser_running = {
+        let mut browser = state.browser.lock().map_err(|_| "浏览器状态锁已损坏")?;
+        browser.refresh("127.0.0.1", BROWSER_PORT);
+        matches!(
+            browser.state,
+            ServiceState::Running | ServiceState::Starting
+        )
+    };
+    if browser_should_run && !browser_running {
+        let _ = start_browser(&state, &updated);
+    } else if !browser_should_run && browser_running {
+        unregister_chrome_native_host();
+        state
+            .browser
+            .lock()
+            .map_err(|_| "浏览器状态锁已损坏")?
+            .stop();
+    }
+    let data = snapshot(&state)?;
+    if updated.auto_open_dsh_window && matches!(data.dsh_state, ServiceState::Running) {
+        let _ = open_dsh_window(&app);
+    }
+    Ok(data)
+}
+
+#[tauri::command]
+fn start_services(app: tauri::AppHandle) -> Result<AppSnapshot, String> {
+    let state = app.state::<AppState>();
+    let config = state.config.lock().map_err(|_| "配置状态锁已损坏")?.clone();
+    {
+        let mut dsh = state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?;
+        dsh.refresh(&config.dsh_host, config.dsh_port);
+        if matches!(dsh.state, ServiceState::Running | ServiceState::Starting) {
+            return snapshot(&state);
+        }
+        dsh.state = ServiceState::Starting;
+        dsh.message = "启动任务已提交".into();
+    }
+    if config.enable_mca {
+        let mut mca = state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?;
+        mca.refresh("127.0.0.1", MCA_PORT);
+        if !matches!(mca.state, ServiceState::Running | ServiceState::Starting) {
+            mca.state = ServiceState::Starting;
+            mca.message = "准备内容与浏览器能力".into();
+        }
+    }
+    let worker = app.clone();
+    let auto_open = config.auto_open_dsh_window;
+    thread::spawn(move || {
+        let state = worker.state::<AppState>();
+        if config.enable_mca {
+            let _ = start_mca(&state, &config);
+        }
+        if config.enable_browser || config.enable_chrome_use {
+            let _ = start_browser(&state, &config);
+        }
+        if let Err(error) = start_dsh(&state, &config) {
+            if let Ok(mut dsh) = state.dsh.lock() {
+                dsh.state = ServiceState::Error;
+                dsh.message = error;
+            }
+        } else {
+            // 旧会话的模型选择平移到 deepseek-plus（图片发送适配）。
+            migrate_sessions_to_plus(&config.dsh_host, config.dsh_port);
+            if auto_open {
+                let handle = worker.clone();
+                let window_handle = handle.clone();
+                let _ = handle.run_on_main_thread(move || {
+                    let _ = open_dsh_window(&window_handle);
+                });
+            }
+        }
+    });
+    snapshot(&state)
+}
+
+#[tauri::command]
+fn stop_services(app: tauri::AppHandle) -> Result<AppSnapshot, String> {
+    let state = app.state::<AppState>();
+    unregister_chrome_native_host();
+    state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?.stop();
+    state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?.stop();
+    state
+        .browser
+        .lock()
+        .map_err(|_| "浏览器状态锁已损坏")?
+        .stop();
+    sync_dsh_window(&app, ServiceState::Stopped);
+    snapshot(&state)
+}
+
+#[cfg(target_os = "windows")]
+fn open_external_url(url: &str) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let operation: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
+    let target: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as isize <= 32 {
+        return Err(format!("无法调用系统浏览器（ShellExecute={result:?}）"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_external_url(url: &str) -> Result<(), String> {
+    let command = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    Command::new(command)
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_dsh(state: State<'_, AppState>) -> Result<(), String> {
+    let config = state.config.lock().map_err(|_| "配置状态锁已损坏")?.clone();
+    if !is_dsh_endpoint(&config.dsh_host, config.dsh_port) {
+        return Err("DSH 页面尚未就绪，请稍后重试或查看诊断日志".into());
+    }
+    open_external_url(&format!("http://{}:{}", config.dsh_host, config.dsh_port))
+}
+
+fn dsh_window_url(config: &StoredConfig) -> String {
+    format!("http://{}:{}", config.dsh_host, config.dsh_port)
+}
+
+/// Opens (or focuses) the embedded DSH desktop window. The window is a
+/// WebView2 view of the DSH web UI, so DSH no longer needs a browser tab.
+fn open_dsh_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let config = state.config.lock().map_err(|_| "配置状态锁已损坏")?.clone();
+    let url_string = dsh_window_url(&config);
+    if !is_dsh_endpoint(&config.dsh_host, config.dsh_port) {
+        // 区分“启动中”与“未运行”，给出明确提示而不是静默失败。
+        let dsh_state = state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?.state;
+        let message = if matches!(dsh_state, ServiceState::Starting) {
+            "DSH 正在启动，请稍候再打开".to_string()
+        } else {
+            "DSH 未运行，请先点击“启动 DSH”".to_string()
+        };
+        return Err(message);
+    }
+    if let Some(existing) = app.get_webview_window(DSH_WINDOW_LABEL) {
+        // 复用已有窗口：恢复显示并导航刷新。销毁后重建 WebView2 曾出现
+        // 白屏卡死，因此窗口关闭只隐藏、不销毁（见 on_window_event）。
+        // 不吞错误：任何一步失败都给用户明确提示。
+        existing
+            .show()
+            .map_err(|error| format!("无法显示 DSH 窗口：{error}"))?;
+        existing
+            .set_focus()
+            .map_err(|error| format!("无法聚焦 DSH 窗口：{error}"))?;
+        let navigate_url = url_string
+            .parse::<tauri::Url>()
+            .map_err(|error| format!("无效的 DSH 地址：{error}"))?;
+        existing
+            .navigate(navigate_url)
+            .map_err(|error| format!("无法刷新 DSH 窗口：{error}"))?;
+        return Ok(());
+    }
+    let url = url_string
+        .parse::<tauri::Url>()
+        .map_err(|error| format!("无效的 DSH 地址：{error}"))?;
+    let window = WebviewWindowBuilder::new(app, DSH_WINDOW_LABEL, WebviewUrl::External(url))
+        .title("DeepSeek Harness")
+        .inner_size(1360.0, 900.0)
+        .min_inner_size(960.0, 640.0)
+        .center()
+        // 只允许 DSH 本机页面；其余导航一律拦截。
+        .on_navigation(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"))
+        })
+        // DSH 页面里的 target=_blank / window.open 交给系统浏览器。
+        .on_new_window(|url, _| {
+            let _ = open_external_url(url.as_str());
+            NewWindowResponse::Deny
+        })
+        .build()
+        .map_err(|error| format!("无法打开 DSH 桌面窗口：{error}"))?;
+    let _ = window.set_focus();
+    Ok(())
+}
+
+#[tauri::command]
+fn open_dsh_window_command(app: tauri::AppHandle) -> Result<(), String> {
+    open_dsh_window(&app)
+}
+
+/// Closes the embedded DSH window once DSH is no longer running, so the
+/// window never shows a dead page. Called from status polling commands.
+fn sync_dsh_window(app: &tauri::AppHandle, dsh_state: ServiceState) {
+    if matches!(dsh_state, ServiceState::Stopped | ServiceState::Error) {
+        if let Some(window) = app.get_webview_window(DSH_WINDOW_LABEL) {
+            // 隐藏而不是销毁：销毁后再重建 WebView2 窗口曾出现白屏卡死；
+            // 隐藏保留可随时 show + navigate 恢复。
+            let _ = window.hide();
+        }
+    }
+}
+
+fn tail(path: &Path, max_bytes: usize) -> String {
+    let Ok(mut file) = File::open(path) else {
+        return "(日志尚未生成)".into();
+    };
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return "(日志读取失败)".into();
+    }
+    let start = bytes.len().saturating_sub(max_bytes);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+#[tauri::command]
+fn read_logs(state: State<'_, AppState>) -> String {
+    let root = state.runtime.data_root.join("logs");
+    format!(
+        "=== DSH ===\n{}\n\n=== MCA ===\n{}",
+        tail(&root.join("dsh.log"), 80_000),
+        tail(&root.join("mca.log"), 50_000)
+    )
+}
+
+/// 把字符串转成以 NUL 结尾的 UTF-16（Windows API 用）。
+#[cfg(target_os = "windows")]
+fn to_wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
+/// 读取 Windows 系统代理（IE/系统设置），返回可注入子进程的代理环境变量。
+/// - 已显式设置 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量时不覆盖；
+/// - `NO_PROXY` 固定豁免本机回环地址，避免 MCA 内部 127.0.0.1 通信被代理劫持；
+/// - MCA 的 httpx 请求与 yt-dlp 子进程都会读取这些环境变量，从而跟随系统代理。
+fn system_proxy_env() -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    if std::env::var_os("HTTP_PROXY").is_some() || std::env::var_os("HTTPS_PROXY").is_some() {
+        return vars;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Registry::{
+            HKEY, HKEY_CURRENT_USER, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+        };
+        const SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+        let key = to_wide(SETTINGS);
+        let mut hkey: HKEY = std::ptr::null_mut();
+        unsafe {
+            if RegOpenKeyExW(HKEY_CURRENT_USER, key.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+                return vars;
+            }
+            let mut enabled: u32 = 0;
+            let mut enabled_size = std::mem::size_of::<u32>() as u32;
+            let enabled_name = to_wide("ProxyEnable");
+            let mut proxy = vec![0u16; 4096];
+            let mut proxy_size = (proxy.len() * 2) as u32;
+            let proxy_name = to_wide("ProxyServer");
+            let enabled_ok = RegQueryValueExW(
+                hkey,
+                enabled_name.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                (&mut enabled as *mut u32) as *mut u8,
+                &mut enabled_size,
+            ) == 0;
+            let proxy_ok = RegQueryValueExW(
+                hkey,
+                proxy_name.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                proxy.as_mut_ptr() as *mut u8,
+                &mut proxy_size,
+            ) == 0;
+            RegCloseKey(hkey);
+            if !enabled_ok || enabled != 1 || !proxy_ok {
+                return vars;
+            }
+            let server = String::from_utf16_lossy(&proxy[..proxy_size as usize / 2])
+                .trim_end_matches('\0')
+                .to_string();
+            if server.is_empty() {
+                return vars;
+            }
+            // 支持 "http=host:port;https=host:port" 与裸 "host:port" 两种格式。
+            let mut http_proxy = String::new();
+            let mut https_proxy = String::new();
+            for part in server.split(';') {
+                if let Some((scheme, address)) = part.split_once('=') {
+                    let address = address.trim();
+                    if address.is_empty() {
+                        continue;
+                    }
+                    let url = if address.contains("://") {
+                        address.to_string()
+                    } else {
+                        format!("http://{address}")
+                    };
+                    match scheme.trim() {
+                        "http" => http_proxy = url,
+                        "https" => https_proxy = url,
+                        _ => {}
+                    }
+                } else if !http_proxy.is_empty() && !https_proxy.is_empty() {
+                    break;
+                } else {
+                    let url = if server.contains("://") {
+                        server.clone()
+                    } else {
+                        format!("http://{server}")
+                    };
+                    http_proxy = url.clone();
+                    https_proxy = url;
+                    break;
+                }
+            }
+            if !http_proxy.is_empty() {
+                vars.push(("HTTP_PROXY".into(), http_proxy));
+            }
+            if !https_proxy.is_empty() {
+                vars.push(("HTTPS_PROXY".into(), https_proxy));
+            }
+            if !vars.is_empty() {
+                vars.push(("NO_PROXY".into(), "localhost,127.0.0.1,::1".into()));
+            }
+        }
+    }
+    vars
+}
+
+/// 单实例保护：Windows 命名 Mutex（`Local\` 会话作用域）。
+/// - 首次启动：创建成功，句柄故意泄漏以保持到进程退出（互斥体随进程
+///   退出自动释放，无需显式关闭）。
+/// - 重复启动：Mutex 已存在 → 激活旧实例的主窗口并返回 Err（调用方提示
+///   后退出），防止多个控制中心互相抢 DSH/MCA 服务。
+#[cfg(target_os = "windows")]
+fn ensure_single_instance() -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowTextLengthW, SetForegroundWindow, ShowWindow,
+        SW_RESTORE,
+    };
+
+    const MUTEX_NAME: &str = "Local\\DSHPlusPlus-SingleInstance";
+    let wide = to_wide(MUTEX_NAME);
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+    if handle.is_null() {
+        return Err("创建单实例互斥体失败".into());
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS as u32 {
+        unsafe {
+            CloseHandle(handle);
+        }
+        // 激活已有实例的控制中心窗口（可能在托盘隐藏或最小化）。
+        let target = to_wide("DSH++ 控制中心");
+        let target_ptr = target.as_ptr();
+        unsafe extern "system" fn activate(hwnd: HWND, lparam: LPARAM) -> i32 {
+            let target = lparam as *const u16;
+            let len = GetWindowTextLengthW(hwnd);
+            if len <= 0 {
+                return 1;
+            }
+            let mut buf = vec![0u16; (len + 1) as usize];
+            GetWindowTextW(hwnd, buf.as_mut_ptr(), len + 1);
+            // 逐字符比较窗口标题与目标标题（UTF-16，target 以 NUL 结尾）。
+            let mut i = 0usize;
+            loop {
+                let t = *target.add(i);
+                if t == 0 {
+                    if i == len as usize {
+                        ShowWindow(hwnd, SW_RESTORE);
+                        SetForegroundWindow(hwnd);
+                        return 0;
+                    }
+                    return 1;
+                }
+                if i >= buf.len() || buf[i] != t {
+                    return 1;
+                }
+                i += 1;
+            }
+        }
+        unsafe {
+            EnumWindows(Some(activate), target_ptr as LPARAM);
+        }
+        return Err("已有 DSH++ 实例正在运行".into());
+    }
+    // 裸指针句柄不实现 Drop，函数返回后句柄保持打开（互斥体随进程退出
+    // 由 OS 自动释放），无需显式持有或关闭。
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_single_instance() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    if let Err(error) = ensure_single_instance() {
+        eprintln!("[dshplusplus] {error}");
+        #[cfg(target_os = "windows")]
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK, MessageBoxW};
+            let message = to_wide(
+                "已有 DSH++ 正在运行，已切换到现有窗口。\n如果看不到窗口，请查看系统托盘。",
+            );
+            let caption = to_wide("DSH++");
+            MessageBoxW(std::ptr::null_mut(), message.as_ptr(), caption.as_ptr(), MB_ICONINFORMATION | MB_OK);
+        }
+        return;
+    }
+    tauri::Builder::default()
+        .setup(|app| {
+            let runtime = discover_runtime().map_err(std::io::Error::other)?;
+            let config = load_config(&runtime);
+            let should_start =
+                config.auto_start_dsh || std::env::var_os("DSHPLUSPLUS_AUTO_START").is_some();
+            let auto_open = config.auto_open_dsh_window;
+            let home = effective_dsh_home(&runtime);
+            materialize_dsh_config(&runtime, &config, &home).map_err(std::io::Error::other)?;
+            app.manage(AppState {
+                config: Mutex::new(config),
+                dsh: Mutex::new(ManagedChild::stopped("等待启动")),
+                mca: Mutex::new(ManagedChild::stopped("等待启动")),
+                browser: Mutex::new(ManagedChild::stopped("等待启动")),
+                runtime,
+            });
+
+            // 系统托盘：关闭主窗口只是隐藏，DSH/MCA 继续运行；
+            // 只有从托盘菜单“退出”才真正退出并清理服务进程树。
+            let show_item = MenuItem::with_id(app, "show", "打开控制中心", true, None::<&str>)
+                .map_err(std::io::Error::other)?;
+            let quit_item = MenuItem::with_id(
+                app,
+                "quit",
+                "退出 DSH++（同时停止服务）",
+                true,
+                None::<&str>,
+            )
+            .map_err(std::io::Error::other)?;
+            let menu =
+                Menu::with_items(app, &[&show_item, &quit_item]).map_err(std::io::Error::other)?;
+            let icon = app
+                .default_window_icon()
+                .cloned()
+                .ok_or_else(|| std::io::Error::other("缺少应用图标"))?;
+            TrayIconBuilder::with_id("main-tray")
+                .icon(icon)
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        let state = app.state::<AppState>();
+                        unregister_chrome_native_host();
+                        if let Ok(mut browser) = state.browser.lock() {
+                            browser.stop();
+                        }
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)
+                .map_err(std::io::Error::other)?;
+
+            if should_start {
+                let handle = app.handle().clone();
+                thread::spawn(move || {
+                    let state = handle.state::<AppState>();
+                    let Ok(config) = state.config.lock().map(|value| value.clone()) else {
+                        return;
+                    };
+                    if config.enable_mca {
+                        let _ = start_mca(&state, &config);
+                    }
+                    if config.enable_browser || config.enable_chrome_use {
+                        let _ = start_browser(&state, &config);
+                    }
+                    if start_dsh(&state, &config).is_ok() {
+                        // 旧会话的模型选择平移到 deepseek-plus（图片发送适配）。
+                        migrate_sessions_to_plus(&config.dsh_host, config.dsh_port);
+                        if auto_open {
+                            let window_handle = handle.clone();
+                            let _ = handle.run_on_main_thread(move || {
+                                let _ = open_dsh_window(&window_handle);
+                            });
+                        }
+                    }
+                });
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            // 主窗口点 X：不退出，隐藏到托盘。退出只走托盘菜单。
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    api.prevent_close();
+                    let _ = window.hide();
+                } else if window.label() == DSH_WINDOW_LABEL {
+                    // DSH 内嵌窗口点 X：只隐藏。销毁后重建 WebView2 曾导致
+                    // 白屏卡死，隐藏保留可随时 show + navigate 恢复。
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_snapshot,
+            refresh_status,
+            save_config,
+            start_services,
+            stop_services,
+            open_dsh,
+            open_dsh_window_command,
+            install_chrome_extension,
+            check_for_update,
+            read_logs,
+        ])
+        .run(tauri::generate_context!())
+        .expect("DSHPlusPlus failed to start");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 创建唯一临时目录（不依赖 tempfile crate），返回后由 drop 清理。
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "dshpp-test-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write(path: &Path, content: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn merge_workspace_registry_adds_missing_records_by_path() {
+        let tmp = TempDir::new("ws-merge");
+        let legacy = tmp.path().join("legacy/workspace.json");
+        let target = tmp.path().join("target/workspace.json");
+        // 旧 home：两个 workspace（E:\DeepSeekPlusPlus 与 D:\DeepSeekHarness）
+        write(
+            &legacy,
+            r#"{
+  "unit": { "name": "workspace", "version": 2 },
+  "global": { "initialized": true, "workspaceIds": ["bb729f88-f841-48dd-a74e-8a8de3430ac4", "89b555cb-33e4-4342-8f11-c6ab1ea639c3"], "archivedSessionIds": [] },
+  "tables": { "workspaces": {
+    "bb729f88-f841-48dd-a74e-8a8de3430ac4": { "path": "D:\\SampleProject", "title": "SampleProject", "sessionIds": ["session-4e3dcb3e-ed3c-4be7-ac29-6c69e02b8b29"], "createdAt": "2026-08-14T12:47:40.530Z", "updatedAt": "2026-08-14T16:23:42.035Z" },
+    "89b555cb-33e4-4342-8f11-c6ab1ea639c3": { "path": "E:\\SampleProject", "title": "SampleProject", "sessionIds": ["session-f1b0ccdc-59a6-4215-abc5-281785c7c926"], "createdAt": "2026-08-16T07:19:14.481Z", "updatedAt": "2026-08-16T07:29:45.577Z" }
+  } }
+}"#,
+        );
+        // 目标 home：已有 D:\DeepSeekHarness（同 path，不同 id）
+        write(
+            &target,
+            r#"{
+  "unit": { "name": "workspace", "version": 2 },
+  "global": { "initialized": true, "workspaceIds": ["02b0fd35-b0f2-429e-b996-8f5bef696fc8"], "archivedSessionIds": [] },
+  "tables": { "workspaces": {
+    "02b0fd35-b0f2-429e-b996-8f5bef696fc8": { "path": "D:\\SampleProject", "title": "SampleProject", "sessionIds": ["session-4e3dcb3e-ed3c-4be7-ac29-6c69e02b8b29", "session-2875f894-d63c-4fc6-ad26-b8ed014201bb"], "createdAt": "2026-08-14T12:47:40.530Z", "updatedAt": "2026-08-14T16:23:42.035Z" }
+  } }
+}"#,
+        );
+        merge_workspace_registry(&legacy, &target).unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+        let ws = parsed["tables"]["workspaces"].as_object().unwrap();
+        // 只并入 E:\DeepSeekPlusPlus（D:\ 已有同 path 记录，不重复）
+        assert_eq!(ws.len(), 2, "应合并缺失的 workspace 记录");
+        assert!(ws.contains_key("89b555cb-33e4-4342-8f11-c6ab1ea639c3"));
+        assert!(ws.contains_key("02b0fd35-b0f2-429e-b996-8f5bef696fc8"));
+        let ids = parsed["global"]["workspaceIds"].as_array().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], "02b0fd35-b0f2-429e-b996-8f5bef696fc8", "原有顺序保持在前");
+        assert_eq!(ids[1], "89b555cb-33e4-4342-8f11-c6ab1ea639c3");
+
+        // 幂等：再跑一次不改变内容
+        let before = fs::read(&target).unwrap();
+        merge_workspace_registry(&legacy, &target).unwrap();
+        assert_eq!(before, fs::read(&target).unwrap(), "重复合并必须无副作用");
+    }
+
+    #[test]
+    fn merge_workspace_registry_copies_whole_file_when_target_missing() {
+        let tmp = TempDir::new("ws-copy");
+        let legacy = tmp.path().join("legacy/workspace.json");
+        let target = tmp.path().join("target/storages/workspace.json");
+        write(&legacy, r#"{"unit":{"name":"workspace","version":2},"global":{"initialized":true,"workspaceIds":["a"],"archivedSessionIds":[]},"tables":{"workspaces":{"a":{"path":"D:\\X","title":"X","sessionIds":[],"createdAt":"2026-08-14T00:00:00.000Z","updatedAt":"2026-08-14T00:00:00.000Z"}}}}"#);
+        merge_workspace_registry(&legacy, &target).unwrap();
+        assert!(target.is_file(), "目标注册表缺失时应整体复制");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+        assert_eq!(parsed["tables"]["workspaces"]["a"]["path"], "D:\\X");
+    }
+
+    #[test]
+    fn migrate_portable_home_data_copies_sessions_and_settings_once() {
+        let tmp = TempDir::new("migrate");
+        let legacy = tmp.path().join("legacy/dsh-home");
+        let standard = tmp.path().join("standard/.dsh");
+        // 用 USERPROFILE 指向假标准 home（edition 2021 下 set_var 安全；
+        // 本测试是唯一读写该变量的用例，避免并行竞争）。
+        std::env::set_var("USERPROFILE", tmp.path().join("standard"));
+        let runtime = RuntimePaths {
+            portable: true,
+            data_root: tmp.path().join("legacy"),
+            dsh_home: None,
+            node: None,
+            dsh_cli: None,
+            mca: None,
+            browser_gateway: None,
+        };
+        // 旧便携 home：2 个会话 + workspace 注册 + settings
+        write(
+            &legacy.join("sessions/--D-DeepSeekHarness--/session-abc/session.jsonl.zstd"),
+            "fake-zstd-1",
+        );
+        write(
+            &legacy.join("sessions/--E-DeepSeekPlusPlus--/session-def/session.jsonl.zstd"),
+            "fake-zstd-2",
+        );
+        write(
+            &legacy.join("storages/workspace.json"),
+            r#"{"unit":{"name":"workspace","version":2},"global":{"initialized":true,"workspaceIds":["w1"],"archivedSessionIds":[]},"tables":{"workspaces":{"w1":{"path":"E:\\DeepSeekPlusPlus","title":"DeepSeekPlusPlus","sessionIds":["session-def"],"createdAt":"2026-08-16T00:00:00.000Z","updatedAt":"2026-08-16T00:00:00.000Z"}}}}"#,
+        );
+        write(&legacy.join("settings.yaml"), "agent-default-model:\n  provider: deepseek-official\n");
+        // 标准 home 已有 1 个会话（模拟用户旧数据）
+        write(
+            &standard.join("sessions/--D-DeepSeekHarness--/session-abc/session.jsonl.zstd"),
+            "user-original",
+        );
+
+        migrate_portable_home_data(&runtime).unwrap();
+
+        // 会话：只复制缺失的 session-def；session-abc 保留用户原文件
+        assert_eq!(
+            fs::read_to_string(
+                standard.join("sessions/--D-DeepSeekHarness--/session-abc/session.jsonl.zstd")
+            )
+            .unwrap(),
+            "user-original",
+            "已存在的会话不得被覆盖"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                standard.join("sessions/--E-DeepSeekPlusPlus--/session-def/session.jsonl.zstd")
+            )
+            .unwrap(),
+            "fake-zstd-2",
+            "缺失的会话应被复制"
+        );
+        // workspace 注册表：整体复制（目标缺失）
+        assert!(standard.join("storages/workspace.json").is_file());
+        // settings.yaml：目标缺失时继承
+        assert_eq!(
+            fs::read_to_string(standard.join("settings.yaml")).unwrap(),
+            "agent-default-model:\n  provider: deepseek-official\n"
+        );
+
+        // 幂等：再跑一次，用户文件仍不被覆盖，也没有重复复制
+        migrate_portable_home_data(&runtime).unwrap();
+        assert_eq!(
+            fs::read_to_string(
+                standard.join("sessions/--D-DeepSeekHarness--/session-abc/session.jsonl.zstd")
+            )
+            .unwrap(),
+            "user-original"
+        );
+    }
+
+    #[test]
+    fn migrate_skipped_when_dsh_home_explicit() {
+        let tmp = TempDir::new("migrate-skip");
+        let legacy = tmp.path().join("legacy/dsh-home");
+        write(
+            &legacy.join("sessions/--D-X--/session-abc/session.jsonl.zstd"),
+            "fake",
+        );
+        let runtime = RuntimePaths {
+            portable: true,
+            data_root: tmp.path().join("legacy"),
+            dsh_home: Some(tmp.path().join("explicit-home")),
+            node: None,
+            dsh_cli: None,
+            mca: None,
+            browser_gateway: None,
+        };
+        migrate_portable_home_data(&runtime).unwrap();
+        assert!(
+            !tmp.path().join("explicit-home").exists(),
+            "显式指定 home 时不得迁移"
+        );
+    }
+
+    /// 构造一个最小的可运行 materialize 环境：假的 dsh_cli（带
+    /// node_modules/@dshplusplus 插件包）＋临时 home。
+    fn materialize_env(tag: &str) -> (TempDir, RuntimePaths, PathBuf) {
+        let tmp = TempDir::new(tag);
+        let scope = tmp.path().join("runtime/node_modules/@dshplusplus");
+        for pkg in ["multimodal", "multimodal-llm", "multimodal-router", "tool-media-inspect", "bundle-plus"] {
+            write(&scope.join(pkg).join("package.json"), r#"{"name":"x","version":"0.0.0"}"#);
+        }
+        let cli = tmp
+            .path()
+            .join("runtime/node_modules/@deepseek-ai/dsh/lib/bin.js");
+        write(&cli, "// fake cli");
+        let home = tmp.path().join("home");
+        let runtime = RuntimePaths {
+            portable: true,
+            data_root: tmp.path().join("data"),
+            dsh_home: Some(home.clone()),
+            node: None,
+            dsh_cli: Some(cli),
+            mca: None,
+            browser_gateway: None,
+        };
+        (tmp, runtime, home)
+    }
+
+    #[test]
+    fn materialize_generates_deepseek_plus_from_builtin_defaults() {
+        let (_tmp, runtime, home) = materialize_env("mat-defaults");
+        let config = StoredConfig::default();
+        materialize_dsh_config(&runtime, &config, &home).unwrap();
+
+        let settings_path = home.join("settings.yaml");
+        let settings: serde_yaml::Value =
+            serde_yaml::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        let plus = &settings["llm-pi-ai"]["providers"]["deepseek-plus"];
+        assert_eq!(plus["apiKeyEnv"], "DEEPSEEK_API_KEY");
+        assert_eq!(plus["baseURL"], "https://api.deepseek.com");
+        let models = plus["models"].as_sequence().unwrap();
+        assert_eq!(models[0]["id"], "deepseek-v4-flash");
+        assert_eq!(models[0]["contextWindow"], 1_000_000u64);
+        assert_eq!(models[0]["maxTokens"], 256_000u64);
+        let input = models[0]["input"].as_sequence().unwrap();
+        assert!(
+            input.iter().any(|v| v == "image"),
+            "deepseek-plus 模型必须声明 image 输入"
+        );
+        // 新用户没有 agent-default-model 段：应创建指向 deepseek-plus 的默认段
+        assert_eq!(settings["agent-default-model"]["provider"], "deepseek-plus");
+        assert_eq!(settings["agent-default-model"]["model"], "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn materialize_preserves_existing_primary_config() {
+        let (_tmp, runtime, home) = materialize_env("mat-existing");
+        let mut config = StoredConfig::default();
+        // 用户显式配置过 llm-deepseek（自定义 baseURL 与模型）
+        write(
+            &home.join("settings.yaml"),
+            r#"agent-default-model:
+  provider: deepseek-official
+  model: deepseek-v4-pro
+  reasoningEffort: max
+llm-deepseek:
+  apiKeyEnv: MY_DEEPSEEK_KEY
+  baseURL: https://proxy.example.com/v1
+  models:
+    - id: deepseek-v4-pro
+      name: DeepSeek-V4-Pro
+      contextWindow: 1000000
+      maxTokens: 256000
+"#,
+        );
+        materialize_dsh_config(&runtime, &config, &home).unwrap();
+
+        let settings: serde_yaml::Value =
+            serde_yaml::from_slice(&fs::read(home.join("settings.yaml")).unwrap()).unwrap();
+        let plus = &settings["llm-pi-ai"]["providers"]["deepseek-plus"];
+        // 平移必须沿用用户显式配置的 baseURL 与 apiKeyEnv，而不是默认值
+        assert_eq!(plus["baseURL"], "https://proxy.example.com/v1");
+        assert_eq!(plus["apiKeyEnv"], "MY_DEEPSEEK_KEY");
+        // 默认模型保留用户选择的模型名，仅平移 provider
+        assert_eq!(settings["agent-default-model"]["provider"], "deepseek-plus");
+        assert_eq!(settings["agent-default-model"]["model"], "deepseek-v4-pro");
+        assert_eq!(settings["agent-default-model"]["reasoningEffort"], "max");
+    }
+}

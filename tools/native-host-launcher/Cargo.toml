@@ -1,0 +1,13 @@
+[package]
+name = "dshplusplus-native-host-launcher"
+version = "0.1.0-dev.1"
+description = "Chrome native messaging host launcher for DSH++ (forwards stdio to node native-host.mjs)"
+edition = "2021"
+
+[[bin]]
+name = "native-host-launcher"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+strip = true

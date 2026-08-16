@@ -1,0 +1,31 @@
+{
+  "name": "@dshplusplus/compatibility",
+  "version": "0.1.0-dev.1",
+  "description": "DSH++ runtime manifest reader and compatibility doctor",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "bin": {
+    "dshplusplus-doctor": "./lib/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    }
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "README.md"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@dshplusplus/multimodal": "workspace:*",
+    "@types/node": "22.20.0"
+  }
+}

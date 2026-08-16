@@ -1,0 +1,13 @@
+{
+  "name": "@dshplusplus/portable-runtime",
+  "version": "0.1.0-dev.1",
+  "private": true,
+  "description": "Production Node runtime dependencies bundled beside DSHPlusPlus.exe",
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.0-rc.6",
+    "@dshplusplus/bundle-plus": "file:../../.tmp/packs/dshplusplus-bundle-plus-0.1.0-dev.1.tgz",
+    "@dshplusplus/multimodal": "file:../../.tmp/packs/dshplusplus-multimodal-0.1.0-dev.1.tgz",
+    "@dshplusplus/multimodal-llm": "file:../../.tmp/packs/dshplusplus-multimodal-llm-0.1.0-dev.1.tgz",
+    "@dshplusplus/multimodal-router": "file:../../.tmp/packs/dshplusplus-multimodal-router-0.1.0-dev.1.tgz"
+  }
+}

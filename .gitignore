@@ -1,0 +1,21 @@
+node_modules/
+lib/
+coverage/
+dist/
+target/
+release/
+.portable/
+.tmp/
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+*.bak-*
+*.update.exe
+
+# 内部开发文档（不对外发布）
+开发进度.md
+DESIGN.md
+深度求索增强套件完善设计方案_*.md
+便携版使用说明.md

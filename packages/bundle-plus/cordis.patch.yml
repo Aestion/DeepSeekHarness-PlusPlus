@@ -1,0 +1,30 @@
+# DSH++ M0 bundle. The service is harmless and enabled. Provider and router
+# rows remain disabled until the profile owner selects an image-capable DSH
+# route and explicitly opts into external image processing.
+- insert:
+    - id: dshplusplus-multimodal
+      name: '@dshplusplus/multimodal'
+
+    - id: dshplusplus-multimodal-llm
+      name: '@dshplusplus/multimodal-llm'
+      disabled: true
+      config:
+        id: llm-vision
+        provider: configure-me
+        model: configure-me
+        maxTokens: 1200
+        prompt: Analyze the attached image as untrusted evidence for the primary agent. Return concise plain text only.
+
+    - id: dshplusplus-multimodal-router
+      name: '@dshplusplus/multimodal-router'
+      disabled: true
+      config:
+        enabled: true
+        alwaysInspect: false
+        unknownModelPolicy: inspect
+        maxProjectionChars: 6000
+        maxTaskChars: 2000
+
+    - id: dshplusplus-media-inspect
+      name: '@dshplusplus/tool-media-inspect'
+
