@@ -52,6 +52,10 @@ DeepSeek Harness（DSH）的增强层：为 DSH 补充**多模态视觉、网页
 
 > DSH 数据存放在标准 dsh home（`~/.dsh`）；`.portable` 目录只放 DSH++ 自身的配置、日志与 Sidecar 数据。
 
+## Lite 插件包（几 MB）
+
+已经装有 DeepSeek Harness？用 **Lite** 版 Release 资产（`DSHPlusPlus-lite-*.zip`，约 30 KB）：只含五个插件包 + 一键安装器，装进你已有的 DSH Profile——**不携带 Node/DSH/MCA 运行时**。要求：Node.js 22+、pnpm、`dsh` 在 PATH 中。解压后运行「安装到已有DSH.cmd」（或 `node install.mjs`），用 `dsh --profile dshplusplus` 启动。完整参数见「使用说明.md」。
+
 ## 作为插件安装到已有 DSH
 
 DSH++ 同时以纯 Cordis 插件包形式分发。源码检出后：

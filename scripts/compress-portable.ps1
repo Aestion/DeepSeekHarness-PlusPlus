@@ -34,8 +34,8 @@ if ($use7z) {
         throw "Unsafe 7z target: $safe"
     }
     if (Test-Path -LiteralPath $safe) { Remove-Item -LiteralPath $safe -Force }
-    # -xr!.portable 排除运行数据（.dsh-home、浏览器数据、日志、证据）
-    & $sevenZip a -t7z -mx=9 -mmt=on "-xr!.portable" $safe (Join-Path $releaseRoot $directoryName)
+    # 排除运行数据（.portable）与本地暂存/备份（update.exe、.bak-*）
+    & $sevenZip a -t7z -mx=9 -mmt=on "-xr!.portable" "-xr!DSHPlusPlus.update.exe" "-xr!*.bak-*" $safe (Join-Path $releaseRoot $directoryName)
     if ($LASTEXITCODE -ne 0) { throw "7z failed with exit code $LASTEXITCODE" }
     $item = Get-Item -LiteralPath $safe
     [ordered]@{ format = '7z'; path = $item.FullName; bytes = $item.Length; mb = [Math]::Round($item.Length / 1MB, 1) } | ConvertTo-Json
@@ -48,7 +48,11 @@ if ([System.IO.Path]::GetDirectoryName($resolvedZip) -ne $releaseRoot) { throw "
 if ([System.IO.Path]::GetFileName($resolvedZip) -notlike 'DSHPlusPlus-*.zip') { throw "Unsafe ZIP name: $resolvedZip" }
 if (Test-Path -LiteralPath $resolvedZip) { Remove-Item -LiteralPath $resolvedZip -Force }
 
-& 'C:\Windows\System32\tar.exe' -a -c -f $resolvedZip --exclude="$directoryName/.portable" -C $releaseRoot $directoryName
+& 'C:\Windows\System32\tar.exe' -a -c -f $resolvedZip `
+    --exclude="$directoryName/.portable" `
+    --exclude="$directoryName/DSHPlusPlus.update.exe" `
+    --exclude="$directoryName/*.bak-*" `
+    -C $releaseRoot $directoryName
 if ($LASTEXITCODE -ne 0) { throw "tar.exe failed with exit code $LASTEXITCODE" }
 
 $item = Get-Item -LiteralPath $resolvedZip

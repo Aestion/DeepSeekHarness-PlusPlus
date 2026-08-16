@@ -52,6 +52,10 @@ An enhancement layer for [DeepSeek Harness](https://github.com/deepseek-ai/DeepS
 
 > DSH data lives in the standard dsh home (`~/.dsh`); the `.portable` folder only holds DSH++'s own config, logs and sidecar data.
 
+## Lite plugin pack (a few MB)
+
+Already have DeepSeek Harness installed? Use the **Lite** release asset (`DSHPlusPlus-lite-*.zip`, ~30 KB): it contains only the five plugin packages plus a one-click installer that targets your existing DSH profile — no bundled Node/DSH/MCA runtime. Requirements: Node.js 22+, pnpm, and `dsh` in PATH. Unzip, then run `安装到已有DSH.cmd` (or `node install.mjs`) and start with `dsh --profile dshplusplus`. Full CLI options are in `使用说明.md`.
+
 ## Install as a plugin into an existing DSH
 
 DSH++ is also distributed as plain Cordis plugin packages. From a source checkout:

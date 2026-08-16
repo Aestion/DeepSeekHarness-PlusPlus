@@ -6,8 +6,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
-# 统一版本号：以根 package.json 为单一来源。
-$version = node -p "require('$workspace/package.json').version"
+# 统一版本号：以根 package.json 为单一来源（PowerShell 解析，避免 node -p 的转义坑）。
+$version = (Get-Content (Join-Path $workspace 'package.json') -Raw | ConvertFrom-Json).version
 $artifactName = "DSHPlusPlus-$version-windows-x64"
 $releaseRoot = Join-Path $workspace 'release'
 $stage = Join-Path $releaseRoot $artifactName
