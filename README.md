@@ -1,5 +1,7 @@
 # DeepSeek Harness PlusPlus (DSH++)
 
+> [中文](README.zh-CN.md) · English
+
 An enhancement layer for [DeepSeek Harness](https://github.com/deepseek-ai/DeepSeekHarness) that adds **multimodal vision, web reading/search, and browser control** without modifying or injecting into the DSH core. It builds on DSH's profile/bundle/plugin/MCP interfaces and external sidecars, so upgrade and failure boundaries stay clean.
 
 > Status: `0.1.0-dev.1` · Windows x64 · works with DSH `0.1.0-rc.6`
