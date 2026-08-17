@@ -2162,7 +2162,7 @@ fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
             return Ok(());
         }
         return Err(format!(
-            "端口 {} 已被其他程序占用，且不是 DSH",
+            "端口 {} 已被其他程序占用，且不是 DSH。若是上次退出残留的 DSH 进程，请在任务管理器中结束占用该端口的进程后重试",
             config.dsh_port
         ));
     }
@@ -2232,7 +2232,7 @@ fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
         service.state = ServiceState::Starting;
         service.message = "正在组合 DSH++ Profile".into();
     }
-    if !wait_for_dsh(&config.dsh_host, config.dsh_port, Duration::from_secs(25)) {
+    if !wait_for_dsh(&config.dsh_host, config.dsh_port, Duration::from_secs(60)) {
         let mut service = state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?;
         service.refresh(&config.dsh_host, config.dsh_port);
         if port_open(&config.dsh_host, config.dsh_port) {
@@ -2240,7 +2240,7 @@ fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
             service.message = format!("端口 {} 已监听，但返回的不是 DSH 页面", config.dsh_port);
         } else if !matches!(service.state, ServiceState::Error) {
             service.state = ServiceState::Error;
-            service.message = "DSH 在 25 秒内没有就绪；请查看诊断日志".into();
+            service.message = "DSH 在 60 秒内没有就绪；请查看诊断日志，或停止占用 18760 端口的残留进程后重试".into();
         }
         return Err(service.message.clone());
     }
@@ -2535,6 +2535,20 @@ fn open_dsh_window(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let config = state.config.lock().map_err(|_| "配置状态锁已损坏")?.clone();
     let url_string = dsh_window_url(&config);
+    // 端点检查带重试：DSH 冷启动/慢启动时首查可能未就绪（Starting 状态
+    // 最多再等 15 秒），避免"明明在启动却报未运行"。
+    let endpoint_ready = is_dsh_endpoint(&config.dsh_host, config.dsh_port);
+    if !endpoint_ready {
+        let dsh_state = state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?.state;
+        let mut waited = Duration::ZERO;
+        while matches!(dsh_state, ServiceState::Starting) && waited < Duration::from_secs(15) {
+            thread::sleep(Duration::from_millis(500));
+            waited += Duration::from_millis(500);
+            if is_dsh_endpoint(&config.dsh_host, config.dsh_port) {
+                break;
+            }
+        }
+    }
     if !is_dsh_endpoint(&config.dsh_host, config.dsh_port) {
         // 区分“启动中”与“未运行”，给出明确提示而不是静默失败。
         let dsh_state = state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?.state;
@@ -2598,7 +2612,11 @@ fn sync_dsh_window(app: &tauri::AppHandle, dsh_state: ServiceState) {
     if matches!(dsh_state, ServiceState::Stopped | ServiceState::Error) {
         if let Some(window) = app.get_webview_window(DSH_WINDOW_LABEL) {
             // 隐藏而不是销毁：销毁后再重建 WebView2 窗口曾出现白屏卡死；
-            // 隐藏保留可随时 show + navigate 恢复。
+            // 隐藏前先卸载页面（about:blank），让 WebView2 释放渲染上下文，
+            // 下次 show + navigate 时以干净状态重新加载，降低白屏概率。
+            if let Ok(url) = "about:blank".parse::<tauri::Url>() {
+                let _ = window.navigate(url);
+            }
             let _ = window.hide();
         }
     }
