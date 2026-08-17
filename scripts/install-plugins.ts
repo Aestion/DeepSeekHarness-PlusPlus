@@ -68,14 +68,21 @@ function resolveDshCli(explicit?: string): { cli: string; node: string } {
   if (pathHit !== undefined) {
     return { cli: pathHit, node: process.execPath }
   }
-  // 便携包：本脚本同级的 runtime（发布包布局：<root>/runtime/dsh/...）
+  // 便携包：完整包布局 <root>/runtime/dsh + <root>/runtime/node 必须同时存在，
+  // 否则视为未命中（避免向上误撞 workspace 根目录的 runtime/dsh 假阳性）。
   const root = dirname(resolve(import.meta.dirname, '..'))
   const portable = join(root, 'runtime', 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
-  if (existsSync(portable)) {
-    const node = join(root, 'runtime', 'node', process.platform === 'win32' ? 'node.exe' : 'node')
-    return { cli: portable, node }
+  const portableNode = join(root, 'runtime', 'node', process.platform === 'win32' ? 'node.exe' : 'node')
+  if (existsSync(portable) && existsSync(portableNode)) {
+    return { cli: portable, node: portableNode }
   }
-  throw new Error('未找到 DSH CLI：请通过 --dsh-cli 指定，或确保 dsh 在 PATH 中')
+  throw new Error(
+    '未找到 DSH CLI。请任选其一：\n' +
+      '  1) 确保 dsh 在 PATH 中；\n' +
+      '  2) 设置环境变量 DSHPLUSPLUS_DSH_CLI 指向 dsh 的 bin.js；\n' +
+      '  3) 通过 --dsh-cli <path> 参数显式指定。\n' +
+      '（Lite 包面向“已有 DeepSeek Harness”的用户；若还没有 DSH，请先安装 DSH，或改用自包含完整包。）',
+  )
 }
 
 function dshHome(explicit?: string): string {
