@@ -29,6 +29,9 @@ struct StoredConfig {
     dsh_host: String,
     dsh_port: u16,
     workspace: String,
+    /// 显式指定的 DSH CLI 路径（bin.js / dsh.cmd / dsh.exe）。空 = 自动发现
+    /// （环境变量 → PATH → npm 全局 → 旧布局）。显式配置优先于自动发现。
+    dsh_cli: String,
     /// 可选远程更新源（JSON：{"version":"x.y.z","url":"https://…/DSHPlusPlus.update.exe"}）。
     /// 为空时"检查更新"只检测本地暂存的 DSHPlusPlus.update.exe。
     update_url: String,
@@ -65,6 +68,7 @@ impl Default for StoredConfig {
                 .to_string_lossy()
                 .into_owned(),
             update_url: String::new(),
+            dsh_cli: String::new(),
             auto_start_dsh: false,
             auto_open_dsh_window: true,
             enable_mca: true,
@@ -96,6 +100,7 @@ struct ConfigInput {
     dsh_host: String,
     dsh_port: u16,
     workspace: String,
+    dsh_cli: String,
     update_url: String,
     auto_start_dsh: bool,
     auto_open_dsh_window: bool,
@@ -126,6 +131,7 @@ struct ConfigView {
     dsh_host: String,
     dsh_port: u16,
     workspace: String,
+    dsh_cli: String,
     update_url: String,
     auto_start_dsh: bool,
     auto_open_dsh_window: bool,
@@ -156,6 +162,7 @@ impl From<&StoredConfig> for ConfigView {
             dsh_host: value.dsh_host.clone(),
             dsh_port: value.dsh_port,
             workspace: value.workspace.clone(),
+            dsh_cli: value.dsh_cli.clone(),
             update_url: value.update_url.clone(),
             auto_start_dsh: value.auto_start_dsh,
             auto_open_dsh_window: value.auto_open_dsh_window,
@@ -899,14 +906,18 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn materialize_profile_plugins(runtime: &RuntimePaths, profile: &Path) -> Result<(), String> {
-    // 插件来源：exe 自带 plugins/@dshplusplus（新布局）→ 旧完整包的
-    // dsh node_modules（兼容）→ 无（跳过，配置仍写入，等插件就绪）。
+fn materialize_profile_plugins(
+    runtime: &RuntimePaths,
+    cli: Option<&Path>,
+    profile: &Path,
+) -> Result<(), String> {
+    // 插件来源：exe 自带 plugins/@dshplusplus（新布局）→ 生效 CLI 的
+    // node_modules（旧布局兼容）→ 无（跳过，配置仍写入，等插件就绪）。
     let source_scope = runtime
         .plugins_dir
         .clone()
         .or_else(|| {
-            runtime.dsh_cli.as_deref().and_then(|cli| {
+            cli.and_then(|cli| {
                 let node_modules = cli
                     .ancestors()
                     .find(|path| path.file_name().is_some_and(|name| name == "node_modules"))?;
@@ -945,7 +956,7 @@ fn materialize_dsh_config(
     // 命名空间化 profile 名：避免与用户自装 dsh 的 profiles/plus 冲突。
     let profile = home.join("profiles/dshplusplus");
     fs::create_dir_all(&profile).map_err(|error| error.to_string())?;
-    materialize_profile_plugins(runtime, &profile)?;
+    materialize_profile_plugins(runtime, effective_dsh_cli(runtime, config).as_deref(), &profile)?;
     let manifest = json!({
         "name": "dsh-profile-dshplusplus",
         "version": VERSION,
@@ -2127,6 +2138,21 @@ fn is_script_cli(cli: &Path) -> bool {
     })
 }
 
+/// 本次启动实际使用的 DSH CLI：显式配置（存在时）优先，否则用自动发现结果。
+fn effective_dsh_cli(runtime: &RuntimePaths, config: &StoredConfig) -> Option<PathBuf> {
+    let explicit = PathBuf::from(config.dsh_cli.trim());
+    if !config.dsh_cli.trim().is_empty() {
+        if explicit.is_file() {
+            return Some(explicit);
+        }
+        eprintln!(
+            "[dshplusplus] 配置的 DSH CLI 不存在（{}），回退到自动发现",
+            config.dsh_cli
+        );
+    }
+    runtime.dsh_cli.clone()
+}
+
 fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
     if port_open(&config.dsh_host, config.dsh_port) {
         if is_dsh_endpoint(&config.dsh_host, config.dsh_port) {
@@ -2141,11 +2167,8 @@ fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
         ));
     }
     let node = state.runtime.node.as_ref().ok_or("未找到 Node 运行时")?;
-    let cli = state
-        .runtime
-        .dsh_cli
-        .as_ref()
-        .ok_or("未找到本地 DSH。请先安装 DeepSeek Harness（npm i -g @deepseek-ai/dsh 或下载官方安装包），然后在控制中心重新点击「启动 DSH」。")?;
+    let cli = effective_dsh_cli(&state.runtime, config)
+        .ok_or("未找到本地 DSH。请先安装 DeepSeek Harness（npm i -g @deepseek-ai/dsh 或下载官方安装包），或在「运行环境」中指定 DSH CLI 路径，然后重新点击「启动 DSH」。")?;
     // 使用标准 home 时，把旧便携 home（.portable/dsh-home）的数据一次性并入
     // 标准 home（幂等；失败不阻塞启动，见诊断日志）。
     if let Err(error) = migrate_portable_home_data(&state.runtime) {
@@ -2161,19 +2184,19 @@ fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
     let (stdout, stderr) = log_files(&state.runtime, "dsh")?;
     // CLI 形态适配：bin.js 用内置 node 跑；.cmd/.bat 是 npm shim，用 cmd /c；
     // .exe 直接执行。
-    let mut command = if is_script_cli(cli) {
+    let mut command = if is_script_cli(&cli) {
         let mut command = Command::new(node);
-        command.arg(cli);
+        command.arg(&cli);
         command
     } else if cli
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
     {
         let mut command = Command::new("cmd");
-        command.arg("/c").arg(cli);
+        command.arg("/c").arg(&cli);
         command
     } else {
-        Command::new(cli)
+        Command::new(&cli)
     };
     command
         .args([
@@ -2257,7 +2280,7 @@ fn snapshot(state: &AppState) -> Result<AppSnapshot, String> {
             portable: state.runtime.portable,
             data_root: path_string(&state.runtime.data_root),
             dsh_home: Some(path_string(&effective_dsh_home(&state.runtime))),
-            dsh_cli: state.runtime.dsh_cli.as_deref().map(path_string),
+            dsh_cli: effective_dsh_cli(&state.runtime, &config).as_deref().map(path_string),
             node_binary: state.runtime.node.as_deref().map(path_string),
             mca_binary: state.runtime.mca.as_deref().map(path_string),
             browser_gateway: state.runtime.browser_gateway.as_deref().map(path_string),
@@ -2329,6 +2352,7 @@ fn save_config(input: ConfigInput, app: tauri::AppHandle) -> Result<AppSnapshot,
         dsh_host: input.dsh_host,
         dsh_port: input.dsh_port,
         workspace: input.workspace,
+        dsh_cli: input.dsh_cli,
         update_url: input.update_url,
         auto_start_dsh: input.auto_start_dsh,
         auto_open_dsh_window: input.auto_open_dsh_window,

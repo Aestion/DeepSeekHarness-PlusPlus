@@ -7,6 +7,7 @@ interface AppConfig {
   dshHost: string
   dshPort: number
   workspace: string
+  dshCli: string
   updateUrl: string
   autoStartDsh: boolean
   autoOpenDshWindow: boolean
@@ -245,9 +246,10 @@ app.innerHTML = `
           <article class="settings-card form-card">
             <div class="card-header"><div><h3>DSH 服务</h3><p>若地址和端口已有 DSH，启动时会自动复用。</p></div><span class="managed-pill">Loopback</span></div>
             <div class="fields">
-              <label>监听地址<input id="dsh-host" value="127.0.0.1" /></label>
+              <label class="wide">监听地址<input id="dsh-host" value="127.0.0.1" /></label>
               <label>端口<input id="dsh-port" type="number" min="1024" max="65535" /></label>
               <label class="wide">默认工作目录<input id="workspace" placeholder="DSH 的默认工作目录" /></label>
+              <label class="wide">DSH CLI 路径（可选）<input id="dsh-cli-path" placeholder="留空自动发现（PATH / npm 全局）；如 D:\DeepSeekHarness\apps\cli\lib\bin.js" /></label>
             </div>
             <label class="check"><input type="checkbox" id="auto-start"><span>打开 DSH++ 时自动启动 DSH</span></label>
             <label class="check"><input type="checkbox" id="auto-open-window"><span>DSH 就绪后自动打开桌面窗口（替代系统浏览器）</span></label>
@@ -429,6 +431,7 @@ function renderAll(data: AppSnapshot): void {
   setValue('dsh-host', c.dshHost)
   setValue('dsh-port', c.dshPort)
   setValue('workspace', c.workspace)
+  setValue('dsh-cli-path', c.dshCli ?? '')
   setValue('update-url', c.updateUrl ?? '')
   setChecked('enable-multimodal', c.enableMultimodal)
   setChecked('enable-mca', c.enableMca)
@@ -473,6 +476,7 @@ byId('save').addEventListener('click', () => perform(async () => {
   const c = snapshot.config
   const input = {
     dshHost: value('dsh-host'), dshPort: Number(value('dsh-port')), workspace: value('workspace'),
+    dshCli: value('dsh-cli-path'),
     updateUrl: value('update-url'),
     autoStartDsh: checked('auto-start'), autoOpenDshWindow: checked('auto-open-window'),
     enableMca: checked('enable-mca'), enableBrowser: checked('enable-browser'),
