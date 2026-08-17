@@ -74,6 +74,14 @@ button:disabled { cursor: default; opacity: .42; }
 .dsh-missing-banner .button { flex: none; min-height: 28px; padding: 0 12px; font-size: 11px; }
 .update-result { display: block; margin-top: 8px; color: var(--tertiary); font-size: 10px; line-height: 15px; }
 .update-result.available { color: #b4541f; }
+.update-components { margin-top: 10px; border-top: 1px solid var(--line-1); padding-top: 8px; }
+.update-row { display: grid; grid-template-columns: minmax(130px, 1fr) auto auto; gap: 8px; align-items: center; padding: 6px 2px; border-bottom: 1px dashed var(--line-1); font-size: 10px; }
+.update-row strong { color: var(--text); font-weight: 600; }
+.update-row .versions { color: var(--tertiary); font-family: "Cascadia Mono", ui-monospace, monospace; font-size: 9px; }
+.update-row .badge { padding: 1px 7px; border-radius: 8px; font-size: 9px; font-weight: 600; }
+.update-row .badge.pending { color: #b4541f; background: #fdf0e4; }
+.update-row .badge.current { color: #3a7a4f; background: #e8f5ec; }
+.update-row small { grid-column: 1 / -1; color: var(--tertiary); font-size: 9px; line-height: 14px; }
 
 .button { display: inline-flex; align-items: center; justify-content: center; min-height: 34px; padding: 0 14px; border-radius: 10px; font-size: 12px; font-weight: 500; white-space: nowrap; }
 .button.primary { color: #fff; border: 1px solid #0f1115; background: #0f1115; }

@@ -255,14 +255,16 @@ app.innerHTML = `
             <label class="check"><input type="checkbox" id="auto-open-window"><span>DSH 就绪后自动打开桌面窗口（替代系统浏览器）</span></label>
           </article>
           <article class="settings-card form-card">
-            <div class="card-header"><div><h3>更新</h3><p>检查本地暂存的新版本，或配置远程更新源（JSON：{"version":"x.y.z","url":"…/DSHPlusPlus.update.exe"}）。</p></div><span class="managed-pill">更新器</span></div>
+            <div class="card-header"><div><h3>更新</h3><p>检查 DSH++、插件、MCA 与上游 DSH 的更新。更新源 URL 指向 JSON 清单（{"app":{…},"plugins":{…},"mca":{…}}）。</p></div><span class="managed-pill">更新器</span></div>
             <div class="fields">
               <label class="wide">远程更新源 URL<input id="update-url" placeholder="留空则只检测本地暂存更新" /></label>
             </div>
             <div class="launcher-actions">
               <button class="button outline" id="check-update">检查更新</button>
+              <button class="button outline" id="apply-updates">更新插件与 MCA</button>
               <span class="update-result" id="update-result"></span>
             </div>
+            <div id="update-components" class="update-components"></div>
           </article>
           <article class="settings-card form-card">
             <div class="card-header"><div><h3>MCA 内容适配层</h3><p>能力开关已移至“扩展能力”页面；这里展示便携运行时位置。</p></div><span class="managed-pill">能力层</span></div>
@@ -558,11 +560,53 @@ document.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach(tab => tab.ad
   byId(`page-${tab.dataset.tab}`).classList.add('active')
 }))
 
+interface ComponentUpdate {
+  name: string
+  current: string | null
+  latest: string | null
+  available: boolean
+  note: string
+}
+
+/** 组件显示名映射。 */
+const COMPONENT_LABELS: Record<string, string> = {
+  app: 'DSH++（控制中心）',
+  multimodal: '插件 multimodal',
+  'multimodal-llm': '插件 multimodal-llm',
+  'multimodal-router': '插件 multimodal-router',
+  'tool-media-inspect': '插件 tool-media-inspect',
+  'bundle-plus': '插件 bundle-plus',
+  mca: 'MCA（内容适配层）',
+  dsh: 'DSH（上游）',
+}
+
+/** 渲染组件更新状态列表。 */
+function renderUpdateComponents(components: ComponentUpdate[]): void {
+  const box = byId('update-components')
+  if (components.length === 0) {
+    box.innerHTML = ''
+    return
+  }
+  box.innerHTML = components.map(component => `
+    <div class="update-row">
+      <strong>${COMPONENT_LABELS[component.name] ?? component.name}</strong>
+      <span class="versions">${component.current ?? '—'} → ${component.latest ?? '—'}</span>
+      <span class="badge ${component.available ? 'pending' : 'current'}">${component.available ? '可更新' : '最新'}</span>
+      <small>${component.note}</small>
+    </div>`).join('')
+}
+
 byId('check-update').addEventListener('click', () => perform(async () => {
-  const result = await invoke<{ available: boolean; version: string | null; message: string }>('check_for_update')
+  const result = await invoke<{ available: boolean; version: string | null; message: string; components: ComponentUpdate[] }>('check_for_update')
   const node = byId('update-result')
   node.textContent = result.message
   node.className = `update-result ${result.available ? 'available' : ''}`
+  renderUpdateComponents(result.components)
+}))
+
+byId('apply-updates').addEventListener('click', () => perform(async () => {
+  const message = await invoke<string>('apply_updates')
+  toast(message)
 }))
 
 byId('get-dsh').addEventListener('click', () => perform(async () => {

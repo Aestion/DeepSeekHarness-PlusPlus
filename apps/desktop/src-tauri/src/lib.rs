@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -442,32 +443,45 @@ fn discover_runtime() -> Result<RuntimePaths, String> {
         .or_else(|| find_dsh_npm_global())
         .or_else(|| sibling_dsh.is_file().then_some(sibling_dsh))
         .or_else(|| project_dsh.filter(|path| path.is_file()));
-    // exe 自带的 DSH++ 插件目录（完整包布局：<root>/plugins/@dshplusplus/*）。
-    let plugins_dir = exe_dir
-        .join("plugins/@dshplusplus")
-        .is_dir()
-        .then_some(exe_dir.join("plugins/@dshplusplus"));
-    let mca = std::env::var_os("DSHPLUSPLUS_MCA")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-        .or_else(|| sibling_mca.is_file().then_some(sibling_mca))
-        .or_else(|| project_mca.filter(|path| path.is_file()));
-    let browser_gateway = std::env::var_os("DSHPLUSPLUS_BROWSER")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
-        .or_else(|| sibling_browser.is_file().then_some(sibling_browser))
-        .or_else(|| project_browser.filter(|path| path.is_file()));
-
     let data_root = std::env::var_os("DSHPLUSPLUS_DATA_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             if portable {
                 exe_dir.join(".portable")
             } else {
-                project.unwrap_or(exe_dir).join(".tmp/desktop-data")
+                project.clone().unwrap_or_else(|| exe_dir.clone()).join(".tmp/desktop-data")
             }
         });
     fs::create_dir_all(&data_root).map_err(|error| format!("无法创建数据目录：{error}"))?;
+    // 插件目录：在线更新的副本（data_root/plugins，可写）优先，回退 exe 自带。
+    let plugins_dir = {
+        let updated = data_root.join("plugins/@dshplusplus");
+        if updated.is_dir() {
+            updated
+        } else {
+            exe_dir.join("plugins/@dshplusplus")
+        }
+    };
+    let plugins_dir = plugins_dir.is_dir().then_some(plugins_dir);
+    // MCA：在线更新的副本（data_root/mca，可写）优先，回退内置/环境变量。
+    let mca = {
+        let updated = data_root.join("mca/mca-runtime.exe");
+        if updated.is_file() {
+            Some(updated)
+        } else {
+            std::env::var_os("DSHPLUSPLUS_MCA")
+                .map(PathBuf::from)
+                .filter(|path| path.is_file())
+                .or_else(|| sibling_mca.is_file().then_some(sibling_mca))
+                .or_else(|| project_mca.filter(|path| path.is_file()))
+        }
+    };
+    let browser_gateway = std::env::var_os("DSHPLUSPLUS_BROWSER")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| sibling_browser.is_file().then_some(sibling_browser))
+        .or_else(|| project_browser.filter(|path| path.is_file()));
+
     // dsh 数据目录：默认与用户自装 dsh 共享标准 home（~/.dsh），卸载/更新
     // dsh++ 不影响 dsh 数据；仅显式要求便携时才放回包内数据目录。
     let dsh_home = std::env::var_os("DSHPLUSPLUS_DSH_HOME")
@@ -1835,24 +1849,179 @@ fn auto_activate_chrome_use(state: &AppState) -> String {
     }
 }
 
-/// 更新检查结果（本地暂存 + 可选远程源）。
+/// 组件更新状态（DSH++ / 插件 / MCA / DSH 通用）。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ComponentUpdate {
+    /// 组件名（app / multimodal / multimodal-llm / multimodal-router /
+    /// tool-media-inspect / bundle-plus / mca / dsh）。
+    name: String,
+    current: Option<String>,
+    latest: Option<String>,
+    available: bool,
+    note: String,
+}
+
+/// 更新检查结果（本地暂存 + 远程清单 + 组件状态）。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateCheckResult {
+    /// app 是否有新版本（兼容旧前端逻辑）。
     available: bool,
+    /// app 最新版本。
     version: Option<String>,
     message: String,
+    components: Vec<ComponentUpdate>,
 }
 
-/// 检查更新：优先检测 exe 同目录的 DSHPlusPlus.update.exe（本地暂存，
-/// 配合"更新到新版.cmd"使用）；配置了远程更新源（update_url，JSON
-/// {"version":"x.y.z","url":"https://…/DSHPlusPlus.update.exe"}）时，
-/// 对比版本并下载新 exe 到暂存位置。
+/// 远程更新清单（update_url 指向的 JSON）。支持两种格式：
+/// - 新格式：{ "app": {version,url}, "plugins": {urlPrefix, packages:{...}}, "mca": {version,url} }
+/// - 旧格式：{ "version", "url" }（仅 app）
+#[derive(Deserialize, Default)]
+struct UpdateManifest {
+    #[serde(default)]
+    app: Option<ManifestArtifact>,
+    #[serde(default)]
+    plugins: Option<ManifestPlugins>,
+    #[serde(default)]
+    mca: Option<ManifestArtifact>,
+}
+
+#[derive(Deserialize, Default, Clone)]
+struct ManifestArtifact {
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    url: String,
+}
+
+#[derive(Deserialize, Default, Clone)]
+struct ManifestPlugins {
+    /// tarball 的 URL 前缀；完整 URL = url_prefix + dshplusplus-<name>-<version>.tgz
+    #[serde(rename = "urlPrefix", default)]
+    url_prefix: String,
+    #[serde(default)]
+    packages: HashMap<String, String>,
+}
+
+/// GET 一个 URL，返回完整字节（20 秒超时）。
+fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(60)))
+        .build()
+        .into();
+    let response = agent
+        .get(url)
+        .call()
+        .map_err(|error| format!("下载失败（{url}）：{error}"))?;
+    let mut bytes = Vec::new();
+    let mut reader = response.into_body().into_reader();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("下载失败（{url}）：{error}"))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    Ok(bytes)
+}
+
+/// GET 一个远程更新清单（失败返回 Err）。
+fn fetch_update_manifest(url: &str) -> Result<UpdateManifest, String> {
+    let body = String::from_utf8(http_get_bytes(url)?).map_err(|_| "更新清单不是 UTF-8 文本".to_string())?;
+    let mut manifest: UpdateManifest =
+        serde_json::from_str(&body).map_err(|error| format!("更新清单格式无效：{error}"))?;
+    // 兼容旧格式：顶层 version/url 视为 app 字段。
+    if manifest.app.is_none() {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+            let version = value
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let url = value
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !version.is_empty() || !url.is_empty() {
+                manifest.app = Some(ManifestArtifact {
+                    version: version.to_string(),
+                    url: url.to_string(),
+                });
+            }
+        }
+    }
+    Ok(manifest)
+}
+
+/// 读取本地插件版本（优先 data_root/plugins，回退 exe 旁 plugins/）。
+fn plugin_current_versions(runtime: &RuntimePaths) -> HashMap<String, String> {
+    let mut versions = HashMap::new();
+    let data_scope = runtime.data_root.join("plugins/@dshplusplus");
+    let scope = if data_scope.is_dir() {
+        data_scope
+    } else if let Some(dir) = &runtime.plugins_dir {
+        dir.clone()
+    } else {
+        return versions;
+    };
+    for package in [
+        "multimodal",
+        "multimodal-llm",
+        "multimodal-router",
+        "tool-media-inspect",
+        "bundle-plus",
+    ] {
+        let manifest_path = scope.join(package).join("package.json");
+        if let Ok(text) = fs::read_to_string(&manifest_path) {
+            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(version) = manifest.get("version").and_then(serde_json::Value::as_str) {
+                    versions.insert(package.to_string(), version.to_string());
+                }
+            }
+        }
+    }
+    versions
+}
+
+/// 本地 DSH CLI 版本（`node <cli> --version` 首行）。无法获取时返回 None。
+fn local_dsh_version(runtime: &RuntimePaths, config: &StoredConfig) -> Option<String> {
+    let cli = effective_dsh_cli(runtime, config)?;
+    let mut command = if is_script_cli(&cli) {
+        let mut command = std::process::Command::new(runtime.node.as_ref()?);
+        command.arg(&cli);
+        command
+    } else {
+        std::process::Command::new(&cli)
+    };
+    let output = command.arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+}
+
+/// npm registry 上的 DSH 最新版本。
+fn npm_dsh_latest() -> Option<String> {
+    let bytes = http_get_bytes("https://registry.npmjs.org/@deepseek-ai/dsh/latest").ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+/// 检查更新：本地暂存 + 远程清单（app/plugins/mca/dsh 四类组件状态）。
 #[tauri::command]
 fn check_for_update(app: tauri::AppHandle) -> Result<UpdateCheckResult, String> {
-    use std::io::Read;
     let state = app.state::<AppState>();
     let config = state.config.lock().map_err(|_| "配置状态锁已损坏")?.clone();
+    let runtime = state.runtime.clone();
     let exe_dir = std::env::current_exe()
         .map_err(|error| error.to_string())?
         .parent()
@@ -1860,77 +2029,244 @@ fn check_for_update(app: tauri::AppHandle) -> Result<UpdateCheckResult, String> 
         .to_path_buf();
     let staged = exe_dir.join("DSHPlusPlus.update.exe");
 
+    let mut components: Vec<ComponentUpdate> = Vec::new();
+
     // 1) 远程更新源（配置了才用）。
     let remote_url = config.update_url.trim().to_string();
-    if !remote_url.is_empty() {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(20)))
-            .build()
-            .into();
-        let body = agent
-            .get(&remote_url)
-            .call()
-            .map_err(|error| format!("获取更新清单失败：{error}"))?
-            .body_mut()
-            .read_to_string()
-            .map_err(|error| error.to_string())?;
-        let manifest: serde_json::Value =
-            serde_json::from_str(&body).map_err(|error| format!("更新清单格式无效：{error}"))?;
-        let remote_version = manifest
-            .get("version")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let download_url = manifest
-            .get("url")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if remote_version.is_empty() || download_url.is_empty() {
-            return Err("更新清单缺少 version 或 url 字段".into());
-        }
-        if remote_version != VERSION {
-            let response = agent
-                .get(download_url)
-                .call()
-                .map_err(|error| format!("下载更新失败：{error}"))?;
-            let mut bytes = Vec::new();
-            let mut reader = response.into_body().into_reader();
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                let read = reader
-                    .read(&mut buffer)
-                    .map_err(|error| format!("下载更新失败：{error}"))?;
-                if read == 0 {
-                    break;
-                }
-                bytes.extend_from_slice(&buffer[..read]);
+    let manifest = if remote_url.is_empty() {
+        None
+    } else {
+        match fetch_update_manifest(&remote_url) {
+            Ok(manifest) => Some(manifest),
+            Err(error) => {
+                components.push(ComponentUpdate {
+                    name: "app".into(),
+                    current: Some(VERSION.into()),
+                    latest: None,
+                    available: false,
+                    note: format!("清单获取失败：{error}"),
+                });
+                None
             }
-            write_atomic(&staged, &bytes)?;
-            return Ok(UpdateCheckResult {
-                available: true,
-                version: Some(remote_version.into()),
-                message: format!("发现新版本 {remote_version}，已下载。请退出后运行“更新到新版.cmd”。"),
+        }
+    };
+
+    // app（DSH++ 自身）：清单有更新则立即下载暂存（配合"更新到新版.cmd"）。
+    let app_artifact = manifest.as_ref().and_then(|m| m.app.clone());
+    if let Some(artifact) = &app_artifact {
+        let app_available = artifact.version != VERSION;
+        if app_available && !artifact.url.is_empty() {
+            match http_get_bytes(&artifact.url) {
+                Ok(bytes) => {
+                    write_atomic(&staged, &bytes)
+                        .map_err(|error| format!("暂存更新失败：{error}"))?;
+                    components.push(ComponentUpdate {
+                        name: "app".into(),
+                        current: Some(VERSION.into()),
+                        latest: Some(artifact.version.clone()),
+                        available: true,
+                        note: "已下载到 DSHPlusPlus.update.exe；退出后运行“更新到新版.cmd”即可生效".into(),
+                    });
+                }
+                Err(error) => components.push(ComponentUpdate {
+                    name: "app".into(),
+                    current: Some(VERSION.into()),
+                    latest: Some(artifact.version.clone()),
+                    available: false,
+                    note: error,
+                }),
+            }
+        } else if staged.is_file() {
+            components.push(ComponentUpdate {
+                name: "app".into(),
+                current: Some(VERSION.into()),
+                latest: Some(artifact.version.clone()),
+                available: false,
+                note: "与清单一致；发现本地暂存的更新文件，退出后运行“更新到新版.cmd”".into(),
+            });
+        } else {
+            components.push(ComponentUpdate {
+                name: "app".into(),
+                current: Some(VERSION.into()),
+                latest: Some(artifact.version.clone()),
+                available: false,
+                note: "已是最新版本".into(),
             });
         }
-        return Ok(UpdateCheckResult {
-            available: false,
-            version: None,
-            message: format!("已是最新版本（{VERSION}）。"),
+    }
+
+    // 插件：对比本地 plugins 版本与清单 packages。
+    if let Some(plugins) = manifest.as_ref().and_then(|m| m.plugins.clone()) {
+        let local = plugin_current_versions(&runtime);
+        for (package, latest) in &plugins.packages {
+            let current = local.get(package).cloned();
+            let available = current.as_deref() != Some(latest.as_str());
+            components.push(ComponentUpdate {
+                name: package.clone(),
+                current,
+                latest: Some(latest.clone()),
+                available,
+                note: if available {
+                    "点击「更新插件与 MCA」下载，重启 DSH 后生效".into()
+                } else {
+                    "已是最新版本".into()
+                },
+            });
+        }
+    }
+
+    // MCA：清单提供最新版本（本地无版本资源，更新即下载替换）。
+    if let Some(artifact) = manifest.as_ref().and_then(|m| m.mca.clone()) {
+        components.push(ComponentUpdate {
+            name: "mca".into(),
+            current: None,
+            latest: Some(artifact.version.clone()),
+            available: !artifact.url.is_empty(),
+            note: "点击「更新插件与 MCA」下载替换，重启后生效".into(),
         });
     }
 
-    // 2) 本地暂存检测。
-    if staged.is_file() {
-        return Ok(UpdateCheckResult {
+    // DSH（上游）：本地 CLI 版本 vs npm registry latest。
+    let dsh_installed = local_dsh_version(&runtime, &config);
+    let dsh_latest = npm_dsh_latest();
+    components.push(ComponentUpdate {
+        name: "dsh".into(),
+        current: dsh_installed.clone(),
+        latest: dsh_latest.clone(),
+        available: match (&dsh_installed, &dsh_latest) {
+            (Some(current), Some(latest)) => current != latest,
+            _ => false,
+        },
+        note: match (&dsh_installed, &dsh_latest) {
+            (Some(current), Some(latest)) if current != latest => {
+                format!("上游有新版 {latest}：npm install -g @deepseek-ai/dsh@latest")
+            }
+            (Some(_), Some(_)) => "已是最新版本".into(),
+            (None, _) => "未安装 DSH（或无法读取版本）".into(),
+            (Some(current), None) => format!("本地 {current}；npm registry 查询失败（网络？）"),
+        },
+    });
+
+    // 2) 本地暂存检测（未配置远程源时）。
+    if manifest.is_none() && staged.is_file() {
+        components.push(ComponentUpdate {
+            name: "app".into(),
+            current: Some(VERSION.into()),
+            latest: None,
             available: true,
-            version: None,
-            message: "发现本地暂存的新版本（DSHPlusPlus.update.exe）。请退出后运行“更新到新版.cmd”。".into(),
+            note: "发现本地暂存的新版本（DSHPlusPlus.update.exe）。请退出后运行“更新到新版.cmd”。".into(),
         });
     }
+
+    let app_update = components
+        .iter()
+        .find(|component| component.name == "app" && component.available);
+    let message = match (&app_update, manifest) {
+        (Some(update), _) => format!(
+            "发现新版本 {}（已下载），请退出后运行“更新到新版.cmd”。",
+            update.latest.as_deref().unwrap_or("DSH++")
+        ),
+        (None, Some(_)) => format!("DSH++ 已是最新（{VERSION}）。"),
+        (None, None) if staged.is_file() => {
+            "发现本地暂存更新，请退出后运行“更新到新版.cmd”。".into()
+        }
+        (None, None) => format!("当前已是最新版本（{VERSION}）。未发现待安装更新。"),
+    };
     Ok(UpdateCheckResult {
-        available: false,
-        version: None,
-        message: format!("当前已是最新版本（{VERSION}）。未发现待安装更新。"),
+        available: app_update.is_some(),
+        version: app_update.and_then(|update| update.latest.clone()),
+        message,
+        components,
     })
+}
+
+/// 应用插件与 MCA 更新：按清单下载插件 tarball 到 data_root/plugins、
+/// MCA 到 data_root/mca，重启 DSH/MCA 后生效。
+#[tauri::command]
+fn apply_updates(app: tauri::AppHandle) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let config = state.config.lock().map_err(|_| "配置状态锁已损坏")?.clone();
+    let runtime = state.runtime.clone();
+    let remote_url = config.update_url.trim().to_string();
+    if remote_url.is_empty() {
+        return Err("未配置远程更新源（运行环境页 → 更新源 URL）。插件与 MCA 无法在线更新。".into());
+    }
+    let manifest = fetch_update_manifest(&remote_url)?;
+    let mut applied: Vec<String> = Vec::new();
+
+    // 插件：下载 tarball → 解压到 data_root/plugins/@dshplusplus/<name>
+    if let Some(plugins) = &manifest.plugins {
+        let local = plugin_current_versions(&runtime);
+        let destination = runtime.data_root.join("plugins/@dshplusplus");
+        fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
+        for (package, latest) in &plugins.packages {
+            let current = local.get(package).cloned();
+            if current.as_deref() == Some(latest.as_str()) {
+                continue;
+            }
+            let tarball_url = format!(
+                "{}{}-{}.tgz",
+                plugins.url_prefix.trim_end_matches('/'),
+                package.replace("@dshplusplus/", "dshplusplus-"),
+                latest
+            );
+            let bytes = http_get_bytes(&tarball_url)?;
+            let cache = runtime.data_root.join("plugins-cache");
+            fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
+            let tarball_path = cache.join(format!(
+                "{}-{}.tgz",
+                package.replace("@dshplusplus/", "dshplusplus-"),
+                latest
+            ));
+            write_atomic(&tarball_path, &bytes)?;
+            // 用系统 tar 解压（package/ 目录）并覆盖目标。
+            let extract_dir = cache.join(format!("extract-{package}-{latest}"));
+            if extract_dir.exists() {
+                fs::remove_dir_all(&extract_dir).map_err(|error| error.to_string())?;
+            }
+            fs::create_dir_all(&extract_dir).map_err(|error| error.to_string())?;
+            let status = std::process::Command::new("tar")
+                .args(["-xzf"])
+                .arg(&tarball_path)
+                .args(["-C"])
+                .arg(&extract_dir)
+                .status()
+                .map_err(|error| format!("解压失败（tar 不可用）：{error}"))?;
+            if !status.success() {
+                return Err(format!("解压插件包失败：{package}"));
+            }
+            let package_dir = extract_dir.join("package");
+            if !package_dir.is_dir() {
+                return Err(format!("插件包结构异常：{package}"));
+            }
+            let target = destination.join(package);
+            if target.exists() {
+                fs::remove_dir_all(&target).map_err(|error| error.to_string())?;
+            }
+            fs::rename(&package_dir, &target).map_err(|error| error.to_string())?;
+            let _ = fs::remove_dir_all(&extract_dir);
+            applied.push(format!("{package} → {latest}"));
+        }
+    }
+
+    // MCA：下载到 data_root/mca/mca-runtime.exe（discover 优先采用）。
+    if let Some(artifact) = &manifest.mca {
+        if !artifact.url.is_empty() {
+            let bytes = http_get_bytes(&artifact.url)?;
+            let mca_dir = runtime.data_root.join("mca");
+            fs::create_dir_all(&mca_dir).map_err(|error| error.to_string())?;
+            write_atomic(&mca_dir.join("mca-runtime.exe"), &bytes)?;
+            applied.push(format!("mca → {}", artifact.version));
+        }
+    }
+
+    if applied.is_empty() {
+        return Ok("插件与 MCA 均已是最新版本".into());
+    }
+    Ok(format!(
+        "已更新：{}。重启 DSH 后插件生效；MCA 会在下次启动时自动使用新版本。",
+        applied.join("，")
+    ))
 }
 
 /// 打开 DeepSeek Harness 获取页面（本机未安装 DSH 时的引导）。
@@ -2956,6 +3292,7 @@ pub fn run() {
             open_dsh_window_command,
             install_chrome_extension,
             check_for_update,
+            apply_updates,
             open_dsh_guide,
             read_logs,
         ])
@@ -2966,6 +3303,26 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 更新清单解析：新格式（app/plugins/mca）与旧格式（顶层 version/url）兼容。
+    #[test]
+    fn update_manifest_parses_new_and_legacy_formats() {
+        let new = r#"{
+          "app": { "version": "0.1.0-dev.2", "url": "https://example.com/DSHPlusPlus.update.exe" },
+          "plugins": { "urlPrefix": "https://example.com/dl/", "packages": { "multimodal": "0.1.0-dev.2", "bundle-plus": "0.1.0-dev.2" } },
+          "mca": { "version": "1.0.0", "url": "https://example.com/mca-runtime.exe" }
+        }"#;
+        let manifest: UpdateManifest = serde_json::from_str(new).expect("新格式应可解析");
+        assert_eq!(manifest.app.as_ref().unwrap().version, "0.1.0-dev.2");
+        let plugins = manifest.plugins.as_ref().unwrap();
+        assert_eq!(plugins.url_prefix, "https://example.com/dl/");
+        assert_eq!(plugins.packages.get("multimodal").unwrap(), "0.1.0-dev.2");
+        assert_eq!(manifest.mca.as_ref().unwrap().version, "1.0.0");
+
+        let legacy = r#"{ "version": "0.1.0-dev.3", "url": "https://example.com/app.exe" }"#;
+        let manifest: UpdateManifest = serde_json::from_str(legacy).expect("旧格式应可解析");
+        assert!(manifest.app.is_none(), "旧格式顶层字段不直接进 app（由兼容逻辑合并）");
+    }
 
     /// 创建唯一临时目录（不依赖 tempfile crate），返回后由 drop 清理。
     struct TempDir(PathBuf);
