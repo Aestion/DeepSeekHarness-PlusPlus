@@ -328,6 +328,9 @@ struct RuntimePaths {
     dsh_home: Option<PathBuf>,
     node: Option<PathBuf>,
     dsh_cli: Option<PathBuf>,
+    /// exe 自带的 DSH++ 插件目录（<root>/plugins/@dshplusplus），
+    /// materialize 时复制到 home profile。完整包不再内置 DSH 本体。
+    plugins_dir: Option<PathBuf>,
     mca: Option<PathBuf>,
     browser_gateway: Option<PathBuf>,
 }
@@ -402,7 +405,9 @@ fn discover_runtime() -> Result<RuntimePaths, String> {
     let sibling_dsh = exe_dir.join("runtime/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js");
     let sibling_mca = exe_dir.join("runtime/mca/mca-runtime.exe");
     let sibling_browser = exe_dir.join("runtime/browser/gateway.js");
-    let portable = sibling_node.is_file() && sibling_dsh.is_file();
+    // 本机发现的 DSH：完整包不再内置 DSH 本体。exe 自带的是 @dshplusplus
+    // 插件（plugins/），DSH 本体由用户安装（PATH / npm 全局 / 旧完整包布局）。
+    let portable = sibling_node.is_file() && (sibling_dsh.is_file() || exe_dir.join("plugins/@dshplusplus").is_dir());
 
     let project = find_project_root(&exe_dir)
         .or_else(|| find_project_root(Path::new(env!("CARGO_MANIFEST_DIR"))));
@@ -422,15 +427,19 @@ fn discover_runtime() -> Result<RuntimePaths, String> {
         .filter(|path| path.is_file())
         .or_else(|| sibling_node.is_file().then_some(sibling_node))
         .or_else(|| project_node.is_file().then_some(project_node));
+    // DSH CLI 发现：显式环境变量 → PATH 中的 dsh → npm 全局 → 旧完整包布局 → 开发检出。
     let dsh_cli = std::env::var_os("DSHPLUSPLUS_DSH_CLI")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
+        .or_else(|| find_dsh_on_path())
+        .or_else(|| find_dsh_npm_global())
         .or_else(|| sibling_dsh.is_file().then_some(sibling_dsh))
-        .or_else(|| project_dsh.filter(|path| path.is_file()))
-        .or_else(|| {
-            let source = PathBuf::from(r"D:\DeepSeekHarness\apps\cli\lib\bin.js");
-            source.is_file().then_some(source)
-        });
+        .or_else(|| project_dsh.filter(|path| path.is_file()));
+    // exe 自带的 DSH++ 插件目录（完整包布局：<root>/plugins/@dshplusplus/*）。
+    let plugins_dir = exe_dir
+        .join("plugins/@dshplusplus")
+        .is_dir()
+        .then_some(exe_dir.join("plugins/@dshplusplus"));
     let mca = std::env::var_os("DSHPLUSPLUS_MCA")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
@@ -470,9 +479,31 @@ fn discover_runtime() -> Result<RuntimePaths, String> {
         dsh_home,
         node,
         dsh_cli,
+        plugins_dir,
         mca,
         browser_gateway,
     })
+}
+
+/// 在 PATH 中查找 `dsh`（dsh.exe / dsh.cmd / dsh）。
+fn find_dsh_on_path() -> Option<PathBuf> {
+    let output = std::process::Command::new("where")
+        .arg("dsh")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().find(|line| !line.trim().is_empty()).map(PathBuf::from)
+}
+
+/// 查找 npm 全局安装的 dsh（`%APPDATA%\npm\node_modules\@deepseek-ai\dsh\lib\bin.js`）。
+fn find_dsh_npm_global() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA").map(PathBuf::from)?;
+    let candidate = base
+        .join("npm/node_modules/@deepseek-ai/dsh/lib/bin.js");
+    candidate.is_file().then_some(candidate)
 }
 
 /// dsh 的标准数据目录：不设 `DSH_HOME` 时 dsh 使用 `~/.dsh`
@@ -869,17 +900,25 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
 }
 
 fn materialize_profile_plugins(runtime: &RuntimePaths, profile: &Path) -> Result<(), String> {
-    let Some(cli) = runtime.dsh_cli.as_deref() else {
-        return Err("未找到 DSH 运行时".into());
+    // 插件来源：exe 自带 plugins/@dshplusplus（新布局）→ 旧完整包的
+    // dsh node_modules（兼容）→ 无（跳过，配置仍写入，等插件就绪）。
+    let source_scope = runtime
+        .plugins_dir
+        .clone()
+        .or_else(|| {
+            runtime.dsh_cli.as_deref().and_then(|cli| {
+                let node_modules = cli
+                    .ancestors()
+                    .find(|path| path.file_name().is_some_and(|name| name == "node_modules"))?;
+                let scope = node_modules.join("@dshplusplus");
+                scope.is_dir().then_some(scope)
+            })
+        })
+        .filter(|scope| scope.is_dir());
+    let Some(source_scope) = source_scope else {
+        eprintln!("[dshplusplus] 未找到 @dshplusplus 插件来源（plugins/ 或旧布局），跳过插件复制");
+        return Ok(());
     };
-    let node_modules = cli
-        .ancestors()
-        .find(|path| path.file_name().is_some_and(|name| name == "node_modules"))
-        .ok_or("无法定位便携 DSH node_modules")?;
-    let source_scope = node_modules.join("@dshplusplus");
-    if !source_scope.is_dir() {
-        return Err("便携运行时缺少 @dshplusplus 插件包".into());
-    }
     let destination_scope = profile.join("node_modules/@dshplusplus");
     for package in [
         "multimodal",
@@ -890,7 +929,8 @@ fn materialize_profile_plugins(runtime: &RuntimePaths, profile: &Path) -> Result
     ] {
         let source = source_scope.join(package);
         if !source.is_dir() {
-            return Err(format!("便携运行时缺少 @dshplusplus/{package}"));
+            eprintln!("[dshplusplus] 缺少 @dshplusplus/{package}，跳过");
+            continue;
         }
         copy_directory(&source, &destination_scope.join(package))?;
     }
@@ -1882,6 +1922,17 @@ fn check_for_update(app: tauri::AppHandle) -> Result<UpdateCheckResult, String> 
     })
 }
 
+/// 打开 DeepSeek Harness 获取页面（本机未安装 DSH 时的引导）。
+#[tauri::command]
+fn open_dsh_guide() -> Result<(), String> {
+    let url = "https://github.com/deepseek-ai/DeepSeekHarness#readme";
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .spawn()
+        .map_err(|error| format!("无法打开浏览器：{error}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 fn install_chrome_extension(state: State<'_, AppState>) -> Result<String, String> {
     let destination = prepare_chrome_extension(&state)?;
@@ -2067,6 +2118,15 @@ fn migrate_sessions_to_plus(host: &str, port: u16) {
     }
 }
 
+/// CLI 是否是 Node 脚本（.js/.mjs/.cjs——用内置 node 执行）。
+fn is_script_cli(cli: &Path) -> bool {
+    cli.extension().is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("js")
+            || ext.eq_ignore_ascii_case("mjs")
+            || ext.eq_ignore_ascii_case("cjs")
+    })
+}
+
 fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
     if port_open(&config.dsh_host, config.dsh_port) {
         if is_dsh_endpoint(&config.dsh_host, config.dsh_port) {
@@ -2081,7 +2141,11 @@ fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
         ));
     }
     let node = state.runtime.node.as_ref().ok_or("未找到 Node 运行时")?;
-    let cli = state.runtime.dsh_cli.as_ref().ok_or("未找到 DSH 运行时")?;
+    let cli = state
+        .runtime
+        .dsh_cli
+        .as_ref()
+        .ok_or("未找到本地 DSH。请先安装 DeepSeek Harness（npm i -g @deepseek-ai/dsh 或下载官方安装包），然后在控制中心重新点击「启动 DSH」。")?;
     // 使用标准 home 时，把旧便携 home（.portable/dsh-home）的数据一次性并入
     // 标准 home（幂等；失败不阻塞启动，见诊断日志）。
     if let Err(error) = migrate_portable_home_data(&state.runtime) {
@@ -2095,9 +2159,23 @@ fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
         PathBuf::from(&config.workspace)
     };
     let (stdout, stderr) = log_files(&state.runtime, "dsh")?;
-    let mut command = Command::new(node);
+    // CLI 形态适配：bin.js 用内置 node 跑；.cmd/.bat 是 npm shim，用 cmd /c；
+    // .exe 直接执行。
+    let mut command = if is_script_cli(cli) {
+        let mut command = Command::new(node);
+        command.arg(cli);
+        command
+    } else if cli
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+    {
+        let mut command = Command::new("cmd");
+        command.arg("/c").arg(cli);
+        command
+    } else {
+        Command::new(cli)
+    };
     command
-        .arg(cli)
         .args([
             "--profile",
             "dshplusplus",
@@ -2836,6 +2914,7 @@ pub fn run() {
             open_dsh_window_command,
             install_chrome_extension,
             check_for_update,
+            open_dsh_guide,
             read_logs,
         ])
         .run(tauri::generate_context!())
@@ -2954,6 +3033,7 @@ mod tests {
             dsh_home: None,
             node: None,
             dsh_cli: None,
+            plugins_dir: None,
             mca: None,
             browser_gateway: None,
         };
@@ -3029,6 +3109,7 @@ mod tests {
             dsh_home: Some(tmp.path().join("explicit-home")),
             node: None,
             dsh_cli: None,
+            plugins_dir: None,
             mca: None,
             browser_gateway: None,
         };
@@ -3058,6 +3139,7 @@ mod tests {
             dsh_home: Some(home.clone()),
             node: None,
             dsh_cli: Some(cli),
+            plugins_dir: None,
             mca: None,
             browser_gateway: None,
         };

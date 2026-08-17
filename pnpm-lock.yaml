@@ -2282,12 +2282,13 @@ packages:
     resolution: {integrity: sha512-Qn0FCSwCQnpnj6SB31I6i2sIKgKWnkbJM8O0EU91Gv2UsYVvtZTl6IA0sCwk2e2MZf5S8w5hpq9QkeVvK9qwxg==}
 
   '@dshplusplus/bundle-plus@file:.tmp/packs/dshplusplus-bundle-plus-0.1.0-dev.1.tgz':
-    resolution: {integrity: sha512-VLbKWwek6J/J2WAJenWq1BUha5+7Z13+ZWN3IiRzVA3GNcNvpjm/OoBqRgewlHEiKua1MxdPPlvg7sK1NA8JSA==, tarball: file:.tmp/packs/dshplusplus-bundle-plus-0.1.0-dev.1.tgz}
+    resolution: {integrity: sha512-iUBQP2evErWjlMhAFfDq2jfJxyvBEQFuvirOPWNPCcU26v2vg95IMlUAHtR58wVdK21Mpx7//rP5xGuVG5/aOg==, tarball: file:.tmp/packs/dshplusplus-bundle-plus-0.1.0-dev.1.tgz}
     version: 0.1.0-dev.1
     peerDependencies:
       '@dshplusplus/multimodal': 0.1.0-dev.1
       '@dshplusplus/multimodal-llm': 0.1.0-dev.1
       '@dshplusplus/multimodal-router': 0.1.0-dev.1
+      '@dshplusplus/tool-media-inspect': 0.1.0-dev.1
     peerDependenciesMeta:
       '@dshplusplus/multimodal':
         optional: true
@@ -2295,9 +2296,11 @@ packages:
         optional: true
       '@dshplusplus/multimodal-router':
         optional: true
+      '@dshplusplus/tool-media-inspect':
+        optional: true
 
   '@dshplusplus/multimodal-llm@file:.tmp/packs/dshplusplus-multimodal-llm-0.1.0-dev.1.tgz':
-    resolution: {integrity: sha512-nvvfdPWWnPDnOkDm8CUDPjzT91452ePbmT7dIJtYsdI9OaiP7ccnJpPGiYjhtIyQ05IMyBNTGM5Dew9eO3Crlg==, tarball: file:.tmp/packs/dshplusplus-multimodal-llm-0.1.0-dev.1.tgz}
+    resolution: {integrity: sha512-/JBCtQgHt1Gol5JQj1Gd+A5MpeVYpCAp6DoFhXHYQgC6S4RWD0smoVhyBoDWvHSxUW1Igd+EEU0bZVBQj6Uriw==, tarball: file:.tmp/packs/dshplusplus-multimodal-llm-0.1.0-dev.1.tgz}
     version: 0.1.0-dev.1
     peerDependencies:
       '@deepseek-ai/cordis': ^4.0.1
@@ -2308,7 +2311,7 @@ packages:
         optional: true
 
   '@dshplusplus/multimodal-router@file:.tmp/packs/dshplusplus-multimodal-router-0.1.0-dev.1.tgz':
-    resolution: {integrity: sha512-pkjzR2ZGrnqaarlyxhBxh+K12s6DlFGESWPkfzOjIc9/zqh9D+3Z4scNy0TDdy255R0wdjU0cCRot+2KS8bcdA==, tarball: file:.tmp/packs/dshplusplus-multimodal-router-0.1.0-dev.1.tgz}
+    resolution: {integrity: sha512-m8LpBlFfaVVQUTBrcvhPnodYKB8Qe8omNt0hhnOLt4PY5d766CSsVIzYTUEFpETzCqQd59e76JVj6ToAC0Wm0g==, tarball: file:.tmp/packs/dshplusplus-multimodal-router-0.1.0-dev.1.tgz}
     version: 0.1.0-dev.1
     peerDependencies:
       '@deepseek-ai/cordis': ^4.0.1
@@ -2320,7 +2323,7 @@ packages:
         optional: true
 
   '@dshplusplus/multimodal@file:.tmp/packs/dshplusplus-multimodal-0.1.0-dev.1.tgz':
-    resolution: {integrity: sha512-Aqnkz7vzcf+VcCbUIiUdXJjwQg1piKTFbQP35GcRPlvcjltESQUlTnTVqEwFMAJAyJOka11rcB08ULnUjeukGA==, tarball: file:.tmp/packs/dshplusplus-multimodal-0.1.0-dev.1.tgz}
+    resolution: {integrity: sha512-uLFEcKPtZxukopbh5Bz7bs4uIdfjXHSuyYkNfc6yMDtlAwCyPNocb5OZGWzC5gcNwHFeA3MW/Z7OmxDgvlKroQ==, tarball: file:.tmp/packs/dshplusplus-multimodal-0.1.0-dev.1.tgz}
     version: 0.1.0-dev.1
     peerDependencies:
       '@deepseek-ai/cordis': ^4.0.1

@@ -87,72 +87,35 @@ if (Test-Path -LiteralPath $launcherExe) {
     Copy-Item -LiteralPath $launcherExe -Destination (Join-Path $browserStage 'native-host-launcher.exe')
 }
 
-$deployTarget = Join-Path $stage 'runtime\dsh'
-New-Item -ItemType Directory -Force -Path $deployTarget | Out-Null
-# DSH++ 的代码库不携带 DSH 本体：运行时组装清单由本脚本在构建时生成
-# （DSH 版本取自已提交的 compatibility.json，依赖从 npm registry 拉取）。
-$compat = Get-Content (Join-Path $workspace 'runtime\manifests\compatibility.json') -Raw | ConvertFrom-Json
-$dshVersion = $compat.deepseekHarness.publishedPackageBaseline
-$portablePackage = @"
-{
-  "name": "dshplusplus-portable-runtime",
-  "version": "$version",
-  "private": true,
-  "dependencies": {
-    "@deepseek-ai/dsh": "$dshVersion"
-  }
-}
-"@
-[System.IO.File]::WriteAllText(
-    (Join-Path $deployTarget 'package.json'),
-    $portablePackage,
-    (New-Object System.Text.UTF8Encoding($false))
-)
-$portableWorkspace = @"
-packages:
-  - .
-
-nodeLinker: hoisted
-
-allowBuilds:
-  '@deepseek-ai/dsh-subprocess-local': true
-  '@google/genai': true
-  koffi: true
-  node-pty: true
-  protobufjs: true
-"@
-[System.IO.File]::WriteAllText(
-    (Join-Path $deployTarget 'pnpm-workspace.yaml'),
-    $portableWorkspace,
-    (New-Object System.Text.UTF8Encoding($false))
-)
-$packs = @(
+# DSH 本体不随完整包分发（由 DSHPlusPlus.exe 发现本地安装或引导用户安装）：
+# exe 只自带 DSH++ 插件（plugins/@dshplusplus），materialize 时复制到 home profile。
+$pluginsStage = Join-Path $stage 'plugins\@dshplusplus'
+New-Item -ItemType Directory -Force -Path $pluginsStage | Out-Null
+$packTarballs = @(
     (Join-Path $workspace '.tmp\packs\dshplusplus-multimodal-0.1.0-dev.1.tgz'),
     (Join-Path $workspace '.tmp\packs\dshplusplus-multimodal-llm-0.1.0-dev.1.tgz'),
     (Join-Path $workspace '.tmp\packs\dshplusplus-multimodal-router-0.1.0-dev.1.tgz'),
+    (Join-Path $workspace '.tmp\packs\dshplusplus-tool-media-inspect-0.1.0-dev.1.tgz'),
     (Join-Path $workspace '.tmp\packs\dshplusplus-bundle-plus-0.1.0-dev.1.tgz')
 )
-pnpm --dir $deployTarget add --save-prod --node-linker=hoisted "@deepseek-ai/dsh@$dshVersion" @packs
-if ($LASTEXITCODE -ne 0) { throw 'Portable DSH runtime installation failed.' }
-
-# Strip dev-only artifacts from the portable runtime. Node only executes
-# .js/.mjs/.cjs at runtime, so declarations, source maps, and docs never load
-# and only bloat the archive with very long paths that break stock extractors.
-$runtimeNodeModules = Join-Path $deployTarget 'node_modules'
-$prunePatterns = @('*.d.ts', '*.d.cts', '*.d.mts', '*.map', '*.ts', '*.cts', '*.mts', '*.md', '*.markdown', '*.pdb')
-Get-ChildItem -LiteralPath $runtimeNodeModules -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
-    foreach ($pattern in $prunePatterns) {
-        if ($_.Name -like $pattern) { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue; break }
-    }
+$tmpExtract = Join-Path $workspace '.tmp\portable-plugins'
+if (Test-Path -LiteralPath $tmpExtract) { Remove-Item -LiteralPath $tmpExtract -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $tmpExtract | Out-Null
+foreach ($tarball in $packTarballs) {
+    if (-not (Test-Path -LiteralPath $tarball -PathType Leaf)) { throw "缺少插件包: $tarball（先运行 pnpm pack:plugins）" }
+    $target = Join-Path $tmpExtract ([System.IO.Path]::GetFileNameWithoutExtension($tarball))
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    tar -xzf $tarball -C $target
+    if ($LASTEXITCODE -ne 0) { throw "解压插件包失败: $tarball" }
+    $pkgDir = Join-Path $target 'package'
+    if (-not (Test-Path -LiteralPath (Join-Path $pkgDir 'package.json') -PathType Leaf)) { throw "插件包结构异常: $tarball" }
+    # 目标目录名 = package.json 的 name（@dshplusplus/multimodal → multimodal）
+    $pkgName = (Get-Content (Join-Path $pkgDir 'package.json') -Raw | ConvertFrom-Json).name
+    if (-not $pkgName) { throw "插件包缺少 name: $tarball" }
+    $destName = $pkgName -replace '^@[^/]+/', ''
+    Copy-Item -LiteralPath $pkgDir -Destination (Join-Path $pluginsStage $destName) -Recurse -Force
 }
-# This portable build targets Windows x64 only: drop prebuilt binaries for
-# other platforms (macOS, Linux, win32-arm64) that ship under prebuilds/.
-Get-ChildItem -LiteralPath $runtimeNodeModules -Recurse -Directory -Filter 'prebuilds' -ErrorAction SilentlyContinue | ForEach-Object {
-    $prebuildRoot = $_
-    Get-ChildItem -LiteralPath $prebuildRoot.FullName -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ne 'win32-x64' } |
-        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-}
+Remove-Item -LiteralPath $tmpExtract -Recurse -Force -ErrorAction SilentlyContinue
 
 Copy-Item -LiteralPath (Join-Path $workspace 'PORTABLE_README.md') -Destination (Join-Path $stage 'README.md')
 

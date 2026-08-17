@@ -134,6 +134,10 @@ app.innerHTML = `
             <span class="state" id="browser-state">—</span>
           </div>
         </div>
+        <div class="dsh-missing-banner" id="dsh-missing-banner" hidden>
+          <span>未找到本地 DeepSeek Harness。安装 DSH 后即可从这里一键启动（控制中心其他功能不受影响）。</span>
+          <button class="button outline" id="get-dsh">获取 DSH</button>
+        </div>
         <div class="launcher-actions">
           <button class="button primary" id="start">启动 DSH</button>
           <button class="button outline" id="open">打开 DSH</button>
@@ -401,6 +405,10 @@ function renderStatus(data: AppSnapshot): void {
   }
   syncMcaAvailability(data.mcaRoute)
   syncProviderHealth(data.mcaProviders)
+  // 未找到本地 DSH：显示引导横幅（控制中心其余功能照常）。
+  const missing = data.runtime.dshCli === null
+  byId('dsh-missing-banner').hidden = !missing
+  byId('dsh-runtime').textContent = data.runtime.dshCli ?? (missing ? '未找到（请先安装 DSH）' : '未找到')
   const start = byId<HTMLButtonElement>('start')
   start.disabled = data.dshState === 'starting' || data.dshState === 'running'
   start.textContent = data.dshState === 'starting' ? '正在启动…' : data.dshState === 'running' ? 'DSH 已启动' : '启动 DSH'
@@ -439,7 +447,6 @@ function renderAll(data: AppSnapshot): void {
   byId('vision-key-state').textContent = c.hasVisionKey ? '已安全保存密钥' : '尚未保存密钥'
   byId('data-root').textContent = data.runtime.dataRoot
   byId('node-runtime').textContent = data.runtime.nodeBinary ?? '未找到'
-  byId('dsh-runtime').textContent = data.runtime.dshCli ?? '未找到'
   byId('mca-runtime').textContent = data.runtime.mcaBinary ?? '未找到（可关闭 MCA）'
   byId('browser-runtime').textContent = data.runtime.browserGateway ?? '未找到'
   renderStatus(data)
@@ -552,6 +559,10 @@ byId('check-update').addEventListener('click', () => perform(async () => {
   const node = byId('update-result')
   node.textContent = result.message
   node.className = `update-result ${result.available ? 'available' : ''}`
+}))
+
+byId('get-dsh').addEventListener('click', () => perform(async () => {
+  await invoke('open_dsh_guide')
 }))
 
 void refresh(true)

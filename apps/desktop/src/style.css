@@ -69,6 +69,9 @@ button:disabled { cursor: default; opacity: .42; }
 @keyframes pulse { 50% { opacity: .35; } }
 .state { color: var(--tertiary); font-size: 10px; }
 .launcher-actions { display: flex; flex-direction: column; gap: 7px; min-width: 112px; }
+.dsh-missing-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; padding: 11px 14px; border: 1px solid #e6b98a; border-radius: 12px; background: #fdf6ee; color: #7a4a1d; font-size: 11px; line-height: 17px; }
+.dsh-missing-banner[hidden] { display: none; }
+.dsh-missing-banner .button { flex: none; min-height: 28px; padding: 0 12px; font-size: 11px; }
 .update-result { display: block; margin-top: 8px; color: var(--tertiary); font-size: 10px; line-height: 15px; }
 .update-result.available { color: #b4541f; }
 
