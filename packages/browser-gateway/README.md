@@ -30,7 +30,11 @@ node lib/index.js --host 127.0.0.1 --port 18766 --data <数据根>
 
 ## 工具
 
-`browser_open`、`browser_observe`、`browser_click`、`browser_type`、`browser_press`、`browser_list_tabs`、`browser_close`、`browser_status`。所有工具支持 `mode: managed | shared`。
+`browser_open`、`browser_observe`、`browser_click`、`browser_type`、`browser_press`、`browser_back`、`browser_forward`、`browser_list_tabs`、`browser_close`、`browser_status`、`browser_evaluate`。所有工具支持 `mode: managed | shared`（back/forward 仅受管模式，CDP 历史导航）。
+
+## Chrome 扩展上架（Chrome Web Store）
+
+商店提交材料与步骤见 `STORE_SUBMISSION.md`（隐私文案、权限清单、上架后 ExtensionInstallForcelist 静默安装）。
 
 ## Chrome 扩展安装（chromeUse）
 

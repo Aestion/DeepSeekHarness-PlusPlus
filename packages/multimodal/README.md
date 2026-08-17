@@ -8,8 +8,12 @@ Providers register with `ctx.multimodal.registerProvider()`. With no configured 
 
 The service itself adds no prompt or tools. Its consumer writes a bounded `[DSH++ Multimodal Observation v1]` text block into the existing `user/message`, so stock DSH can save, restore, fork, and compact the model-visible observation without a private session-event type.
 
+## Observation Store
+
+With a `storeRoot` configured (the control center materializes `$DSH_HOME/dshplusplus/observations`), every inspection is appended as one JSONL record per session (`ObservationStore`), including failures. Records carry `sessionId` / `messageId` / `observedAt` plus the full observation (evidence refs included). Query via `ctx.multimodal.observations(sessionId?)`. Store failures never fail the inspection.
+
 ## Known Limitations and Deferred Work
 
 - M0 accepts DSH raster-image attachment references only. Generic documents, audio, and video require the upstream generic-blob attachment path or an explicit path/URL tool.
-- Structured Observation and Evidence persistence belongs to the future Observation Store package; the model-visible text projection remains the compatibility source of truth.
+- The model-visible text projection remains the compatibility source of truth; the store is a durable side channel for evidence and debugging.
 

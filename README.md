@@ -6,7 +6,7 @@ An enhancement layer for [DeepSeek Harness](https://github.com/deepseek-ai/DeepS
 
 > Status: `0.1.0-dev.1` · Windows x64 · works with DSH `0.1.0-rc.6`
 
-> **Repository scope**: this repository contains **only the DSH++ layer**. The DeepSeek Harness core is an upstream dependency (`@deepseek-ai/dsh`, published by DeepSeek) fetched from the npm registry at build/install time — DSH code, its dependency trees, or bundled copies are never part of this repository. GitHub Releases publish only DSH++ artifacts (the Lite plugin pack); the self-contained portable build is assembled locally by `scripts/build-portable.ps1` (it pulls DSH from npm). See [compatibility.json](runtime/manifests/compatibility.json) for the pinned upstream version.
+> **Repository scope**: this repository contains **only the DSH++ layer**. The DeepSeek Harness core is an upstream dependency (`@deepseek-ai/dsh`, published by DeepSeek) fetched from the npm registry at install time — DSH code, its dependency trees, or bundled copies are never part of this repository or the release archives. GitHub Releases publish DSH++ artifacts only: the Lite plugin pack (~26 KB) and the self-contained desktop build (~149 MB, control center + Node + MCA + DSH++ plugins, **no DSH inside** — the exe discovers a local DSH and guides installation when missing). See [compatibility.json](runtime/manifests/compatibility.json) for the supported upstream version.
 
 ## Features
 
@@ -27,11 +27,13 @@ An enhancement layer for [DeepSeek Harness](https://github.com/deepseek-ai/DeepS
 ┌──────────────────────────────────────────────────────────────┐
 │ DSHPlusPlus.exe (Tauri control center)                       │
 │  · manages DSH / MCA / browser-gateway lifecycles            │
+│  · discovers the local DSH (env / PATH / npm global /        │
+│    user-configured CLI); no DSH bundled                      │
 │  · materializes the `dshplusplus` profile under ~/.dsh       │
 └──────────────┬───────────────────────────────┬───────────────┘
-               │ spawn                        │
+               │ spawn local dsh               │ spawn
 ┌──────────────▼───────────────┐   ┌──────────▼────────────────┐
-│ DeepSeek Harness (bundled)   │   │ MCA sidecar (18765)       │
+│ DeepSeek Harness (local)     │   │ MCA sidecar (18765)       │
 │  · @dshplusplus/multimodal   │   │  image/video/audio/doc/   │
 │  · multimodal-router         │   │  web/computer providers   │
 │  · tool-media-inspect        │   │  (system-proxy aware)     │
@@ -49,7 +51,7 @@ An enhancement layer for [DeepSeek Harness](https://github.com/deepseek-ai/DeepS
 
 **Option A — Lite plugin pack (recommended, a few MB).** Already have DeepSeek Harness installed? Download the **Lite** release asset (`DSHPlusPlus-lite-*.zip`, ~30 KB): it contains only the five plugin packages plus a one-click installer that targets your existing DSH profile — no bundled Node/DSH/MCA runtime. Requirements: Node.js 22+, pnpm, and `dsh` in PATH. Unzip, then run `安装到已有DSH.cmd` (or `node install.mjs`) and start with `dsh --profile dshplusplus`. Full CLI options are in `使用说明.md`.
 
-**Option B — self-contained portable build (assembled locally).** Run `powershell -File scripts/build-portable.ps1` in a checkout: it compiles the control center, pulls DSH from npm, and assembles `release/DSHPlusPlus-<version>-windows-x64/` (DSH data still lives in `~/.dsh`; the `.portable` folder only holds DSH++'s own config, logs and sidecar data). Double-click `DSHPlusPlus.exe`, configure an optional vision model (multimodal expert), click **启动 DSH**, configure the primary model in DSH (`设置 → 模型`), then send an image — it is described by the vision model and projected into the conversation.
+**Option B — self-contained desktop build.** Download the `DSHPlusPlus-0.1.0-dev.1-windows-x64.zip` release asset (~149 MB) and extract anywhere. **DeepSeek Harness itself is not bundled** — the control center discovers a local DSH (PATH / npm global / user-configured CLI path) and starts it for you; if DSH is missing, the control center stays fully usable and shows a banner with a **获取 DSH** button that opens the official install guide. Node, MCA and the DSH++ plugins are bundled. DSH data lives in `~/.dsh`; the `.portable` folder only holds DSH++'s own config, logs and sidecar data. Configure an optional vision model (multimodal expert) in the control center, click **启动 DSH**, configure the primary model in DSH (`设置 → 模型`), then send an image — it is described by the vision model and projected into the conversation.
 
 ## Install as a plugin into an existing DSH
 
