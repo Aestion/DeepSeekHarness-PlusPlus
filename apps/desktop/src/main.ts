@@ -201,7 +201,11 @@ app.innerHTML = `
               <span class="switch compact"><input type="checkbox" id="mca-computer-act" data-mca-capability><span></span></span>
             </label>
           </div>
-          <p class="capability-note">电脑能力默认关闭；启用后仍受 MCA 的风险等级、确认策略与本机自动化运行环境约束。</p>
+          <p class="capability-note" id="computer-hint">电脑能力默认关闭；启用后仍受 MCA 的风险等级、确认策略与本机自动化运行环境约束。</p>
+          <div class="card-actions computer-actions">
+            <button class="button outline" id="enable-computer-provider">启用电脑 Provider</button>
+            <span class="capability-note" id="computer-provider-hint">先启动 MCA，再启用观察和操作。</span>
+          </div>
         </article>
 
         <article class="settings-card capability-card" id="browser-capability-card">
@@ -417,6 +421,18 @@ function renderStatus(data: AppSnapshot): void {
   }
   syncMcaAvailability(data.mcaRoute)
   syncProviderHealth(data.mcaProviders)
+  const computerProvider = data.mcaProviders.find(provider => provider.providerId === 'wheel.pyautogui-desktop')
+  const computerHint = byId('computer-provider-hint')
+  const enableComputerProvider = byId<HTMLButtonElement>('enable-computer-provider')
+  if (computerProvider) {
+    computerHint.textContent = computerProvider.enabled && computerProvider.available
+      ? '电脑 Provider 已就绪；操作仍需 MCA 确认。'
+      : `电脑 Provider 不可用：${computerProvider.detail || '请检查 MCA 日志'}`
+    enableComputerProvider.disabled = computerProvider.enabled && computerProvider.available
+  } else {
+    computerHint.textContent = data.mcaState === 'running' ? '未检测到桌面自动化 Provider。' : '先启动 MCA，再启用观察和操作。'
+    enableComputerProvider.disabled = data.mcaState !== 'running'
+  }
   // 未找到本地 DSH：显示引导横幅（控制中心其余功能照常）。
   const missing = data.runtime.dshCli === null
   byId('dsh-missing-banner').hidden = !missing
@@ -548,8 +564,13 @@ byId('configure-dsh').addEventListener('click', () => perform(async () => { awai
 byId('refresh').addEventListener('click', () => refresh(false))
 byId('install-extension').addEventListener('click', () => perform(async () => {
   const hint = await invoke<string>('install_chrome_extension')
-  toast('Chrome 扩展安装完成，请按提示操作。')
   byId('browser-hint').textContent = hint
+  toast('扩展资源已准备，按 Chrome 页面提示完成首次加载。')
+}))
+byId('enable-computer-provider').addEventListener('click', () => perform(async () => {
+  const data = await invoke<AppSnapshot>('enable_computer_provider')
+  renderAll(data)
+  toast('电脑 Provider 已刷新；请确认观察和操作开关已启用。')
 }))
 byId('reload-logs').addEventListener('click', async () => { byId('logs').textContent = await invoke<string>('read_logs') })
 byId('enable-mca').addEventListener('change', syncMcaControls)

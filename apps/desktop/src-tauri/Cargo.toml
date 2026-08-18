@@ -1,6 +1,6 @@
 [package]
 name = "dshplusplus-desktop"
-version = "0.1.0-dev.2"
+version = "0.1.0-dev.3"
 description = "Portable DeepSeek Harness PlusPlus control center"
 authors = ["DSH++ contributors"]
 edition = "2021"

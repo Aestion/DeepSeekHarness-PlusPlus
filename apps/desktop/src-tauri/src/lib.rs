@@ -313,6 +313,15 @@ impl Drop for AppState {
 }
 
 #[cfg(target_os = "windows")]
+fn open_url(url: &str) -> Result<(), String> {
+    Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .spawn()
+        .map_err(|error| format!("无法打开页面：{error}"))?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 fn unregister_chrome_native_host() {
     let mut command = Command::new("reg");
     command.args([
@@ -1679,6 +1688,74 @@ fn assign_kill_on_close_job(_: &Child) -> Option<isize> {
     None
 }
 
+/// 生成 MCA Agent 探测 shim（deepseek.cmd）的批处理内容。
+///
+/// MCA 通过 PATH 上的 `deepseek` 命令探测 deepseek-tui Agent，并执行
+/// `deepseek mcp add` 自注册。当前 DSH CLI（无 `mcp` 子命令、裸调用要求
+/// --profile）无法直接满足这两个探测，因此 shim 做两件事：
+/// - 无 `--profile` 参数时注入默认 profile `dshplusplus`；
+/// - 仿真 `mcp list/add/remove`（真实注册由控制中心写入 profile patch 完成，
+///   标记文件只用于让 `list` 输出与 `add` 行为保持一致）。
+fn agent_shim_content(launcher: &str) -> String {
+    format!(
+        r#"@echo off
+rem DSH++ generated: MCA agent detection shim (recreated on each start)
+if "%1"=="mcp" goto :mcp
+echo %* | findstr /C:"--profile" >nul
+if %errorlevel%==0 (
+  {launcher} %*
+) else (
+  {launcher} --profile dshplusplus %*
+)
+exit /b %errorlevel%
+
+:mcp
+shift
+set "MCAEMUDIR=%~dp0mcp-emulation"
+if "%1"=="list" (
+  if exist "%MCAEMUDIR%\mca-control-center" (
+    type "%MCAEMUDIR%\mca-control-center"
+  ) else (
+    echo No MCP servers configured.
+  )
+  exit /b 0
+)
+if "%1"=="add" (
+  if not exist "%MCAEMUDIR%" mkdir "%MCAEMUDIR%"
+  echo %4: %3 ^(Streamable HTTP^)> "%MCAEMUDIR%\%4"
+  exit /b 0
+)
+if "%1"=="remove" (
+  if exist "%MCAEMUDIR%\%2" del "%MCAEMUDIR%\%2"
+  exit /b 0
+)
+exit /b 0
+"#
+    )
+}
+
+/// 在 `<data_root>/agent-shims/` 生成 `deepseek.cmd` 与 `dsh.cmd`，
+/// 返回 shim 目录（供注入 MCA 子进程 PATH）。DSH CLI 未发现或写入失败时
+/// 返回 None（MCA 探测会失败，但错误信息会通过路由健康显示，不影响其他功能）。
+fn ensure_agent_shims(state: &AppState, config: &StoredConfig) -> Option<PathBuf> {
+    let cli = effective_dsh_cli(&state.runtime, config)?;
+    let launcher = if cli.extension().and_then(|ext| ext.to_str()) == Some("js") {
+        let node = state.runtime.node.as_ref()?;
+        format!("\"{}\" \"{}\"", path_string(node), path_string(&cli))
+    } else {
+        format!("\"{}\"", path_string(&cli))
+    };
+    let dir = state.runtime.data_root.join("agent-shims");
+    fs::create_dir_all(&dir).ok()?;
+    write_atomic(&dir.join("deepseek.cmd"), agent_shim_content(&launcher).as_bytes()).ok()?;
+    write_atomic(
+        &dir.join("dsh.cmd"),
+        format!("@echo off\r\n{launcher} %*\r\n").as_bytes(),
+    )
+    .ok()?;
+    Some(dir)
+}
+
 fn configure_mca_route(
     state: &AppState,
     config: &StoredConfig,
@@ -1707,14 +1784,30 @@ fn configure_mca_route(
         .timeout_global(Some(Duration::from_secs(5)))
         .build()
         .into();
-    // 电脑能力需要 MCA 桌面自动化 Provider（默认禁用）：先启用它，否则
-    // MCA 会拒绝含 computer.* 能力的路由（400）。幂等，失败不致命——
-    // 若 Provider 真不可用，随后的路由 PUT 会走现有错误处理。
+    // 刷新 MCA 的 Agent 探测缓存：shim 可能刚刚生成（MCA 进程启动时已
+    // 带上 agent-shims 的 PATH，但复用已运行的 MCA 时需要主动刷新）。
+    // 探测较慢（逐个 Agent 启动子进程查版本），给它独立的更长超时；失败不阻塞。
+    {
+        let detect_agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(20)))
+            .build()
+            .into();
+        let _ = detect_agent
+            .post(&format!(
+                "http://127.0.0.1:{MCA_PORT}/api/agent-routes/detect"
+            ))
+            .send_json(json!({}));
+    }
+    // 电脑能力需要 MCA 桌面自动化 Provider（默认禁用）。保留服务端
+    // 返回结果，避免 Provider 启动失败时仍把 computer.* 报成可用。
     if capabilities.iter().any(|capability| capability.starts_with("computer.")) {
         let provider_url = format!(
             "http://127.0.0.1:{MCA_PORT}/api/providers/wheel.pyautogui-desktop/state"
         );
-        let _ = agent.post(&provider_url).send_json(json!({ "enabled": true }));
+        if let Err(error) = agent.post(&provider_url).send_json(json!({ "enabled": true })) {
+            let mut service = state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?;
+            service.message = format!("电脑 Provider 启用失败：{error}");
+        }
     }
     if let Err(error) = agent.put(&route_url).send_json(route) {
         let mut service = state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?;
@@ -1915,21 +2008,6 @@ fn prepare_chrome_extension(state: &AppState) -> Result<PathBuf, String> {
         ));
     }
     Ok(destination)
-}
-
-/// 查找本机 Chrome 可执行文件。
-fn find_chrome_exe() -> Option<PathBuf> {
-    std::env::var_os("DSHPLUSPLUS_CHROME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            [
-                PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-                PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default())
-                    .join(r"Google\Chrome\Application\chrome.exe"),
-            ]
-            .into_iter()
-            .find(|path| path.is_file())
-        })
 }
 
 /// chromeUse 自动激活：幂等准备扩展；Chrome 未运行时自动以
@@ -2378,35 +2456,39 @@ fn open_dsh_guide() -> Result<(), String> {
 #[tauri::command]
 fn install_chrome_extension(state: State<'_, AppState>) -> Result<String, String> {
     let destination = prepare_chrome_extension(&state)?;
-    let mut hint = String::from(
-        "Chrome 扩展已安装：\n1. 若 Chrome 正在运行，请完全退出后，用下面的命令重新启动 Chrome：\n",
-    );
-    let chrome = find_chrome_exe();
-    if let Some(chrome) = chrome {
-        let launch = format!(
-            "\"{}\" --load-extension=\"{}\"\n2. 已打开的页面请按 F5 刷新后再使用 chromeUse。\n3. Chrome 137+ 的 --load-extension 可能不生效：请打开 chrome://extensions，开启“开发者模式”，点“加载已解压的扩展程序”选择：\n{}",
-            path_string(&chrome),
-            path_string(&destination),
-            path_string(&destination)
-        );
-        hint.push_str(&launch);
-        // Only auto-launch when no Chrome instance is running (loading a new
-        // extension requires a fresh process).
-        let chrome_running = std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq chrome.exe", "/NH"])
-            .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).contains("chrome.exe"))
-            .unwrap_or(false);
-        if !chrome_running {
-            let _ = std::process::Command::new(&chrome)
-                .arg(format!("--load-extension={}", path_string(&destination)))
-                .spawn();
-            hint.push_str("\n3. 已为你启动 Chrome（含扩展）。");
+    let destination_text = path_string(&destination);
+    // Chrome 137+ blocks the old command-line loading path for normal profiles.
+    // Open the exact extensions page and copy the directory so the one required
+    // confirmation is reduced to a single paste-and-select action.
+    let _ = open_url("chrome://extensions");
+    let mut clipboard = Command::new("clip");
+    clipboard
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Ok(mut child) = clipboard.spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(destination_text.as_bytes());
         }
-    } else {
-        hint.push_str("未找到 Chrome；请手动安装扩展后使用。");
+        let _ = child.wait();
     }
-    Ok(hint)
+    Ok(format!(
+        "扩展文件已准备：{destination_text}\nChrome 扩展页面已打开，已将目录复制到剪贴板。请开启“开发者模式”，点击“加载已解压的扩展程序”，粘贴目录并确认；然后刷新目标页面。"
+    ))
+}
+
+#[tauri::command]
+fn enable_computer_provider(state: State<'_, AppState>) -> Result<AppSnapshot, String> {
+    let config = state.config.lock().map_err(|_| "配置锁已损坏")?.clone();
+    if !config.enable_mca {
+        return Err("请先在扩展能力中启用 MCA 能力层".into());
+    }
+    if !port_open("127.0.0.1", MCA_PORT) {
+        return Err("MCA 尚未运行，请先点击“启动 DSH”启动能力层".into());
+    }
+    configure_mca_route(&state, &config, true)?;
+    snapshot(&state)
 }
 
 fn start_mca(state: &AppState, config: &StoredConfig) -> Result<(), String> {
@@ -2414,6 +2496,8 @@ fn start_mca(state: &AppState, config: &StoredConfig) -> Result<(), String> {
         return Ok(());
     }
     let reused = port_open("127.0.0.1", MCA_PORT);
+    // 先生成 agent-shims（MCA 通过 PATH 上的 `deepseek` 命令探测 deepseek-tui）。
+    let shim_dir = ensure_agent_shims(state, config);
     if !reused {
         let binary = state
             .runtime
@@ -2438,6 +2522,17 @@ fn start_mca(state: &AppState, config: &StoredConfig) -> Result<(), String> {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         command.env("MCA_DATA_ROOT", &data);
+        // 把 agent-shims 目录前置到 MCA 的 PATH：MCA 的 Agent 探测
+        // （shutil.which）使用进程环境，优先命中我们生成的 deepseek.cmd。
+        if let Some(dir) = shim_dir.as_ref() {
+            let existing = std::env::var_os("PATH").unwrap_or_default();
+            let joined = format!(
+                "{};{}",
+                path_string(dir),
+                existing.to_string_lossy()
+            );
+            command.env("PATH", joined);
+        }
         // 跟随系统代理：MCA 的 httpx 请求（网页/在线媒体）与 yt-dlp 子进程
         // 都读取 HTTP_PROXY/HTTPS_PROXY；NO_PROXY 豁免本机回环地址。
         for (name, value) in system_proxy_env() {
@@ -3408,6 +3503,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            enable_computer_provider,
             refresh_status,
             save_config,
             start_services,
@@ -3481,6 +3577,27 @@ mod tests {
     fn write(path: &Path, content: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    /// agent shim 内容：包含默认 profile 注入与 mcp 子命令仿真，
+    /// launcher（node+bin.js 或独立 exe）原样嵌入。
+    #[test]
+    fn agent_shim_content_contains_profile_injection_and_mcp_emulation() {
+        let content = agent_shim_content(r#""C:\node.exe" "E:\DSH\bin.js""#);
+        assert!(content.contains(r#""C:\node.exe" "E:\DSH\bin.js""#), "launcher 原样嵌入");
+        assert!(
+            content.contains("--profile dshplusplus"),
+            "无 profile 时注入默认 profile"
+        );
+        assert!(content.contains("if \"%1\"==\"mcp\""), "拦截 mcp 子命令");
+        assert!(
+            content.contains("mca-control-center"),
+            "mcp list 读取注册标记"
+        );
+        assert!(
+            content.contains("No MCP servers configured."),
+            "无注册时的 list 输出"
+        );
     }
 
     #[test]
