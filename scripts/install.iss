@@ -9,7 +9,7 @@
 #endif
 
 #define MyAppName "DSHPlusPlus"
-#define MyAppVersion "0.1.0-dev.1"
+#define MyAppVersion "0.1.0-dev.2"
 #define MyAppPublisher "DSH++"
 #define MyAppExeName "DSHPlusPlus.exe"
 

@@ -72,6 +72,7 @@ button:disabled { cursor: default; opacity: .42; }
 .dsh-missing-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; padding: 11px 14px; border: 1px solid #e6b98a; border-radius: 12px; background: #fdf6ee; color: #7a4a1d; font-size: 11px; line-height: 17px; }
 .dsh-missing-banner[hidden] { display: none; }
 .dsh-missing-banner .button { flex: none; min-height: 28px; padding: 0 12px; font-size: 11px; }
+.missing-actions { display: flex; flex: none; gap: 7px; }
 .update-result { display: block; margin-top: 8px; color: var(--tertiary); font-size: 10px; line-height: 15px; }
 .update-result.available { color: #b4541f; }
 .update-components { margin-top: 10px; border-top: 1px solid var(--line-1); padding-top: 8px; }
@@ -129,6 +130,9 @@ input, select { display: block; width: 100%; height: 38px; margin-top: 7px; padd
 input:focus, select:focus { border-color: var(--deepseek); box-shadow: 0 0 0 2px rgba(65,118,230,.12); }
 input::placeholder { color: var(--dimmed); }
 label small { display: block; margin-top: 5px; color: var(--tertiary); font-size: 9px; font-weight: 400; }
+.path-field { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 7px; margin-top: 7px; }
+.path-field input { margin-top: 0; }
+.path-field .button { min-height: 38px; border-radius: 8px; }
 .secret { display: flex; position: relative; }
 .secret input { padding-right: 52px; }
 .secret button { position: absolute; top: 9px; right: 3px; height: 34px; padding: 0 9px; border: 0; color: var(--tertiary); background: transparent; font-size: 10px; }
@@ -142,6 +146,7 @@ label small { display: block; margin-top: 5px; color: var(--tertiary); font-size
 .savebar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 14px; padding: 12px 14px 12px 16px; border-radius: 12px; color: var(--tertiary); background: var(--bg-subtle); font-size: 10px; }
 .runtime-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .runtime-grid .form-card { margin-top: 0; }
+.runtime-actions { display: flex; justify-content: flex-end; margin-top: 18px; }
 .runtime-list { margin: 12px 0 0; }
 .runtime-list div { display: grid; grid-template-columns: 105px minmax(0, 1fr); gap: 8px; padding: 9px 0; border-top: 1px solid var(--line-1); }
 .runtime-list dt { color: var(--tertiary); font-size: 10px; }

@@ -25,7 +25,13 @@ New-Item -ItemType Directory -Force -Path $liteDir | Out-Null
 # 1) 插件 tarball
 $packsDir = Join-Path $liteDir 'packs'
 New-Item -ItemType Directory -Force -Path $packsDir | Out-Null
-Copy-Item -Path (Join-Path $workspace '.tmp\packs\*.tgz') -Destination $packsDir
+$packageNames = @('multimodal', 'multimodal-llm', 'multimodal-router', 'tool-media-inspect', 'bundle-plus')
+foreach ($packageName in $packageNames) {
+    $packageVersion = (Get-Content (Join-Path $workspace "packages\$packageName\package.json") -Raw | ConvertFrom-Json).version
+    $tarball = Join-Path $workspace ".tmp\packs\dshplusplus-$packageName-$packageVersion.tgz"
+    if (-not (Test-Path -LiteralPath $tarball -PathType Leaf)) { throw "Missing plugin tarball: $tarball" }
+    Copy-Item -LiteralPath $tarball -Destination $packsDir
+}
 
 # 2) 零依赖安装器：用项目 tsc 把 scripts/install-plugins.ts 编译为单文件 ESM
 #    （只依赖 node: 内置模块，无需 bundle）。
@@ -55,7 +61,7 @@ if errorlevel 1 (
     exit /b 1
 )
 echo.
-echo Done. Start DSH with:  dsh --profile dshplusplus
+echo Done. Use the start command shown above.
 pause
 '@
 [System.IO.File]::WriteAllText(
@@ -75,7 +81,7 @@ DSH Profile，获得多模态视觉、网页与浏览器能力，**不携带 Nod
 
 - Node.js 22+（在 PATH 中）
 - pnpm（npm install -g pnpm）
-- 已安装 DeepSeek Harness（dsh 命令在 PATH 中，或安装时用参数指定）
+- 已安装 DeepSeek Harness（dsh 命令在 PATH 中、源码仓库位于相邻目录，或安装时用参数指定）
 
 ## 安装
 
@@ -85,8 +91,8 @@ DSH Profile，获得多模态视觉、网页与浏览器能力，**不携带 Nod
 
 可用参数：
 
-    --dsh-cli <path>   dsh CLI 路径（bin.js 或可执行文件）；默认按
-                       DSHPLUSPLUS_DSH_CLI 环境变量 → PATH 中的 dsh 查找
+    --dsh-cli <path>   DeepSeek Harness 仓库目录、bin.js 或可执行文件；默认按
+                       DSHPLUSPLUS_DSH_CLI → PATH 中的 dsh → 相邻源码仓库查找
     --home <path>      DSH_HOME（默认 \$DSH_HOME 或 ~/.dsh）
     --profile <name>   目标 profile（默认 dshplusplus）
     --packs-dir <dir>  插件包目录（默认本包内 packs/）

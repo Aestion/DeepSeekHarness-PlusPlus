@@ -396,6 +396,76 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+const DSH_CLI_RELATIVE_PATHS: &[&str] = &[
+    "apps/cli/lib/bin.js",
+    "lib/bin.js",
+    "@deepseek-ai/dsh/lib/bin.js",
+    "node_modules/@deepseek-ai/dsh/lib/bin.js",
+    "runtime/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js",
+    "bin.js",
+    "dsh.cmd",
+    "dsh.exe",
+];
+
+/// Accept a CLI file or a directory at any common DSH install/source level.
+fn resolve_dsh_cli_candidate(input: &Path) -> Option<PathBuf> {
+    if input.is_file() {
+        return Some(input.to_path_buf());
+    }
+    if !input.is_dir() {
+        return None;
+    }
+    DSH_CLI_RELATIVE_PATHS
+        .iter()
+        .map(|relative| input.join(relative))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Search a small, deterministic set of ancestors and conventional checkout names.
+fn find_dsh_near_paths(starts: &[PathBuf]) -> Option<PathBuf> {
+    const CHECKOUT_NAMES: &[&str] = &["DeepseekHarness", "DeepSeekHarness", "deepseek-harness"];
+    let mut visited = std::collections::HashSet::new();
+    for start in starts {
+        for ancestor in start.ancestors() {
+            let ancestor = ancestor.to_path_buf();
+            if !visited.insert(ancestor.clone()) {
+                continue;
+            }
+            if let Some(cli) = resolve_dsh_cli_candidate(&ancestor) {
+                return Some(cli);
+            }
+            for name in CHECKOUT_NAMES {
+                if let Some(cli) = resolve_dsh_cli_candidate(&ancestor.join(name)) {
+                    return Some(cli);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_dsh_source_checkout() -> Option<PathBuf> {
+    let mut starts = Vec::new();
+    if let Ok(current) = std::env::current_dir() {
+        starts.push(current);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            starts.push(parent.to_path_buf());
+        }
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        starts.extend([
+            profile.clone(),
+            profile.join("source/repos"),
+            profile.join("Documents/GitHub"),
+            profile.join("Projects"),
+            profile.join("dev"),
+        ]);
+    }
+    find_dsh_near_paths(&starts)
+}
+
 fn find_project_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
@@ -435,12 +505,12 @@ fn discover_runtime() -> Result<RuntimePaths, String> {
         .filter(|path| path.is_file())
         .or_else(|| sibling_node.is_file().then_some(sibling_node))
         .or_else(|| project_node.is_file().then_some(project_node));
-    // DSH CLI 发现：显式环境变量 → PATH 中的 dsh → npm 全局 → 旧完整包布局 → 开发检出。
+    // DSH CLI 发现：显式环境变量 → PATH → npm/pnpm 全局 → 相邻源码仓库 → 旧布局。
     let dsh_cli = std::env::var_os("DSHPLUSPLUS_DSH_CLI")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
+        .and_then(|value| resolve_dsh_cli_candidate(&PathBuf::from(value)))
         .or_else(|| find_dsh_on_path())
         .or_else(|| find_dsh_npm_global())
+        .or_else(find_dsh_source_checkout)
         .or_else(|| sibling_dsh.is_file().then_some(sibling_dsh))
         .or_else(|| project_dsh.filter(|path| path.is_file()));
     let data_root = std::env::var_os("DSHPLUSPLUS_DATA_ROOT")
@@ -516,15 +586,35 @@ fn find_dsh_on_path() -> Option<PathBuf> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().find(|line| !line.trim().is_empty()).map(PathBuf::from)
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .and_then(|line| resolve_dsh_cli_candidate(Path::new(line)))
 }
 
-/// 查找 npm 全局安装的 dsh（`%APPDATA%\npm\node_modules\@deepseek-ai\dsh\lib\bin.js`）。
+/// 查找 npm/pnpm 全局安装的 dsh；不依赖 GUI 进程继承到最新 PATH。
 fn find_dsh_npm_global() -> Option<PathBuf> {
-    let base = std::env::var_os("APPDATA").map(PathBuf::from)?;
-    let candidate = base
-        .join("npm/node_modules/@deepseek-ai/dsh/lib/bin.js");
-    candidate.is_file().then_some(candidate)
+    let mut candidates = Vec::new();
+    if let Some(base) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        candidates.push(base.join("npm"));
+    }
+    if let Some(base) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        candidates.push(base.join("pnpm"));
+    }
+    if let Some(base) = std::env::var_os("PNPM_HOME").map(PathBuf::from) {
+        candidates.push(base);
+    }
+    for candidate in candidates {
+        if let Some(cli) = resolve_dsh_cli_candidate(&candidate) {
+            return Some(cli);
+        }
+    }
+    let output = Command::new("npm").args(["root", "--global"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&output.stdout);
+    resolve_dsh_cli_candidate(Path::new(root.trim()))
 }
 
 /// dsh 的标准数据目录：不设 `DSH_HOME` 时 dsh 使用 `~/.dsh`
@@ -850,6 +940,11 @@ fn validate_config(input: &ConfigInput) -> Result<(), String> {
     }
     if !input.workspace.is_empty() && !Path::new(&input.workspace).is_dir() {
         return Err("默认工作目录不存在".into());
+    }
+    if !input.dsh_cli.trim().is_empty()
+        && resolve_dsh_cli_candidate(Path::new(input.dsh_cli.trim())).is_none()
+    {
+        return Err("所选位置中未找到 DSH CLI；请选择 DeepSeekHarness 仓库目录、安装目录或 bin.js/dsh.cmd/dsh.exe".into());
     }
     Ok(())
 }
@@ -2476,10 +2571,9 @@ fn is_script_cli(cli: &Path) -> bool {
 
 /// 本次启动实际使用的 DSH CLI：显式配置（存在时）优先，否则用自动发现结果。
 fn effective_dsh_cli(runtime: &RuntimePaths, config: &StoredConfig) -> Option<PathBuf> {
-    let explicit = PathBuf::from(config.dsh_cli.trim());
     if !config.dsh_cli.trim().is_empty() {
-        if explicit.is_file() {
-            return Some(explicit);
+        if let Some(cli) = resolve_dsh_cli_candidate(Path::new(config.dsh_cli.trim())) {
+            return Some(cli);
         }
         eprintln!(
             "[dshplusplus] 配置的 DSH CLI 不存在（{}），回退到自动发现",
@@ -2487,6 +2581,27 @@ fn effective_dsh_cli(runtime: &RuntimePaths, config: &StoredConfig) -> Option<Pa
         );
     }
     runtime.dsh_cli.clone()
+}
+
+#[tauri::command]
+fn resolve_dsh_cli_path(path: String) -> Result<String, String> {
+    resolve_dsh_cli_candidate(Path::new(path.trim()))
+        .as_deref()
+        .map(path_string)
+        .ok_or_else(|| {
+            "所选位置中未找到 DSH CLI；请选择 DeepSeekHarness 仓库目录、安装目录或 bin.js/dsh.cmd/dsh.exe".into()
+        })
+}
+
+#[tauri::command]
+fn detect_dsh_cli() -> Option<String> {
+    std::env::var_os("DSHPLUSPLUS_DSH_CLI")
+        .and_then(|value| resolve_dsh_cli_candidate(&PathBuf::from(value)))
+        .or_else(find_dsh_on_path)
+        .or_else(find_dsh_npm_global)
+        .or_else(find_dsh_source_checkout)
+        .as_deref()
+        .map(path_string)
 }
 
 fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
@@ -2684,11 +2799,19 @@ fn save_config(input: ConfigInput, app: tauri::AppHandle) -> Result<AppSnapshot,
         Some(value) => Some(protect_secret(value)?),
         None => current.vision_secret.clone(),
     };
+    let dsh_cli = if input.dsh_cli.trim().is_empty() {
+        String::new()
+    } else {
+        path_string(
+            &resolve_dsh_cli_candidate(Path::new(input.dsh_cli.trim()))
+                .ok_or("所选位置中未找到 DSH CLI")?,
+        )
+    };
     *current = StoredConfig {
         dsh_host: input.dsh_host,
         dsh_port: input.dsh_port,
         workspace: input.workspace,
-        dsh_cli: input.dsh_cli,
+        dsh_cli,
         update_url: input.update_url,
         auto_start_dsh: input.auto_start_dsh,
         auto_open_dsh_window: input.auto_open_dsh_window,
@@ -3169,6 +3292,7 @@ pub fn run() {
         return;
     }
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let runtime = discover_runtime().map_err(std::io::Error::other)?;
             let config = load_config(&runtime);
@@ -3294,6 +3418,8 @@ pub fn run() {
             check_for_update,
             apply_updates,
             open_dsh_guide,
+            resolve_dsh_cli_path,
+            detect_dsh_cli,
             read_logs,
         ])
         .run(tauri::generate_context!())
@@ -3355,6 +3481,40 @@ mod tests {
     fn write(path: &Path, content: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn resolves_dsh_cli_from_source_and_installed_directories() {
+        let tmp = TempDir::new("dsh-cli-resolve");
+        let source = tmp.path().join("DeepseekHarness");
+        let source_cli = source.join("apps/cli/lib/bin.js");
+        write(&source_cli, "// source cli");
+        assert_eq!(resolve_dsh_cli_candidate(&source), Some(source_cli.clone()));
+        assert_eq!(
+            resolve_dsh_cli_candidate(&source.join("apps/cli")),
+            Some(source_cli.clone())
+        );
+        assert_eq!(
+            resolve_dsh_cli_candidate(&source.join("apps/cli/lib")),
+            Some(source_cli)
+        );
+
+        let npm_root = tmp.path().join("node_modules");
+        let installed_cli = npm_root.join("@deepseek-ai/dsh/lib/bin.js");
+        write(&installed_cli, "// installed cli");
+        assert_eq!(resolve_dsh_cli_candidate(&npm_root), Some(installed_cli));
+        assert!(resolve_dsh_cli_candidate(&tmp.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn finds_sibling_dsh_source_checkout_from_portable_stage() {
+        let tmp = TempDir::new("dsh-cli-nearby");
+        let stage = tmp.path().join("DSHPlusPlus/zip-stage");
+        fs::create_dir_all(&stage).unwrap();
+        let cli = tmp.path().join("DeepseekHarness/apps/cli/lib/bin.js");
+        write(&cli, "// source cli");
+
+        assert_eq!(find_dsh_near_paths(&[stage]), Some(cli));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import { open } from '@tauri-apps/plugin-dialog'
 import './style.css'
 
 type ServiceState = 'stopped' | 'starting' | 'running' | 'error'
@@ -137,7 +138,10 @@ app.innerHTML = `
         </div>
         <div class="dsh-missing-banner" id="dsh-missing-banner" hidden>
           <span>未找到本地 DeepSeek Harness。安装 DSH 后即可从这里一键启动（控制中心其他功能不受影响）。</span>
-          <button class="button outline" id="get-dsh">获取 DSH</button>
+          <div class="missing-actions">
+            <button class="button outline" id="locate-dsh">选择已有 DSH</button>
+            <button class="button outline" id="get-dsh">获取 DSH</button>
+          </div>
         </div>
         <div class="launcher-actions">
           <button class="button primary" id="start">启动 DSH</button>
@@ -249,10 +253,14 @@ app.innerHTML = `
               <label class="wide">监听地址<input id="dsh-host" value="127.0.0.1" /></label>
               <label>端口<input id="dsh-port" type="number" min="1024" max="65535" /></label>
               <label class="wide">默认工作目录<input id="workspace" placeholder="DSH 的默认工作目录" /></label>
-              <label class="wide">DSH CLI 路径（可选）<input id="dsh-cli-path" placeholder="留空自动发现（PATH / npm 全局）；如 D:\DeepSeekHarness\apps\cli\lib\bin.js" /></label>
+              <label class="wide">DSH 安装位置（可选）
+                <span class="path-field"><input id="dsh-cli-path" placeholder="留空自动发现；可填写仓库目录、安装目录或 CLI 文件" /><button class="button outline" type="button" id="choose-dsh">选择位置</button><button class="button outline" type="button" id="detect-dsh">重新检测</button></span>
+                <small>支持 DeepSeekHarness 仓库根目录、apps\cli、lib、bin.js、dsh.cmd 或 dsh.exe。</small>
+              </label>
             </div>
             <label class="check"><input type="checkbox" id="auto-start"><span>打开 DSH++ 时自动启动 DSH</span></label>
             <label class="check"><input type="checkbox" id="auto-open-window"><span>DSH 就绪后自动打开桌面窗口（替代系统浏览器）</span></label>
+            <div class="runtime-actions"><button class="button primary" id="save-runtime">保存运行环境</button></div>
           </article>
           <article class="settings-card form-card">
             <div class="card-header"><div><h3>更新</h3><p>检查 DSH++、插件、MCA 与上游 DSH 的更新。更新源 URL 指向 JSON 清单（{"app":{…},"plugins":{…},"mca":{…}}）。</p></div><span class="managed-pill">更新器</span></div>
@@ -473,7 +481,7 @@ async function perform(action: () => Promise<void>): Promise<void> {
   finally { busy = false; document.body.classList.remove('busy') }
 }
 
-byId('save').addEventListener('click', () => perform(async () => {
+async function saveConfiguration(): Promise<void> {
   if (!snapshot) return
   const c = snapshot.config
   const input = {
@@ -522,7 +530,10 @@ byId('save').addEventListener('click', () => perform(async () => {
     hints.push('尚未填写视觉模型与 Base URL，多模态暂不生效')
   }
   toast(hints.length > 0 ? hints.join('；') : '配置已保存；主模型仍由 DSH 管理。')
-}))
+}
+
+byId('save').addEventListener('click', () => perform(saveConfiguration))
+byId('save-runtime').addEventListener('click', () => perform(saveConfiguration))
 
 byId('start').addEventListener('click', () => perform(async () => {
   const data = await invoke<AppSnapshot>('start_services')
@@ -554,11 +565,37 @@ document.querySelectorAll<HTMLButtonElement>('[data-reveal]').forEach(button => 
   button.textContent = input.type === 'password' ? '显示' : '隐藏'
 }))
 
-document.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach(tab => tab.addEventListener('click', () => {
+function activatePage(name: string): void {
   document.querySelectorAll('.nav-item,.page').forEach(node => node.classList.remove('active'))
+  const tab = document.querySelector<HTMLButtonElement>(`[data-tab="${name}"]`)
+  if (tab === null) return
   tab.classList.add('active')
-  byId(`page-${tab.dataset.tab}`).classList.add('active')
+  byId(`page-${name}`).classList.add('active')
+}
+
+document.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach(tab => tab.addEventListener('click', () => {
+  activatePage(tab.dataset.tab ?? 'models')
 }))
+
+async function chooseDshInstallation(): Promise<void> {
+  const selected = await open({ directory: true, multiple: false, title: '选择 DeepSeek Harness 安装目录' })
+  if (typeof selected !== 'string') return
+  const cli = await invoke<string>('resolve_dsh_cli_path', { path: selected })
+  setValue('dsh-cli-path', cli)
+  toast('已找到 DSH CLI；点击“保存运行环境”即可使用。')
+}
+
+byId('choose-dsh').addEventListener('click', () => perform(chooseDshInstallation))
+byId('detect-dsh').addEventListener('click', () => perform(async () => {
+  const cli = await invoke<string | null>('detect_dsh_cli')
+  if (cli === null) throw new Error('仍未自动找到 DSH，请使用“选择位置”指定安装目录。')
+  setValue('dsh-cli-path', cli)
+  toast('已自动找到 DSH CLI；点击“保存运行环境”即可使用。')
+}))
+byId('locate-dsh').addEventListener('click', () => {
+  activatePage('runtime')
+  void perform(chooseDshInstallation)
+})
 
 interface ComponentUpdate {
   name: string

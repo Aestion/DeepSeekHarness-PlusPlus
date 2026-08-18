@@ -1,6 +1,6 @@
 {
   "name": "@dshplusplus/compatibility",
-  "version": "0.1.0-dev.1",
+  "version": "0.1.0-dev.2",
   "description": "DSH++ runtime manifest reader and compatibility doctor",
   "type": "module",
   "main": "lib/index.js",

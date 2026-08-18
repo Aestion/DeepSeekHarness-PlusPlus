@@ -1,7 +1,7 @@
 ﻿# 生成远程更新清单 update-manifest.json（发布到 GitHub Release 时上传）。
 # 控制中心的"检查更新"读取该清单（更新源 URL 指向它）。
 # 用法：
-#   powershell -File scripts\build-manifest.ps1 [-Tag v0.1.0-dev.1] [-McaVersion 1.0.0] [-McaUrl https://…/mca-runtime.exe]
+#   powershell -File scripts\build-manifest.ps1 [-Tag v0.1.0-dev.2] [-McaVersion 1.0.0] [-McaUrl https://…/mca-runtime.exe]
 param(
     [string]$Tag = '',
     [string]$McaVersion = '',

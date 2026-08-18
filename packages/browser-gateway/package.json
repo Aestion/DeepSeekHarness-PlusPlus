@@ -1,6 +1,6 @@
 {
   "name": "@dshplusplus/browser-gateway",
-  "version": "0.1.0-dev.1",
+  "version": "0.1.0-dev.2",
   "description": "Browser automation gateway for DSH++: CDP-managed Chrome and shared-tab Chrome extension bridge",
   "type": "module",
   "main": "lib/index.js",

@@ -5,14 +5,14 @@
  * manifest。
  *
  * 用法（tsx scripts/install-plugins.ts [选项]）：
- *   --dsh-cli <path>   dsh CLI 路径（bin.js 或可执行文件）；默认按
- *                      DSHPLUSPLUS_DSH_CLI → PATH 中的 dsh → 便携包顺序查找
+ *   --dsh-cli <path>   DSH 仓库目录、bin.js 或可执行文件；默认按环境变量 →
+ *                      PATH 中的 dsh → 相邻源码仓库 → 便携包顺序查找
  *   --home <path>      DSH_HOME（默认 $DSH_HOME 或 ~/.dsh）
  *   --profile <name>   目标 profile（默认 dshplusplus）
  *   --packs-dir <dir>  tarball 目录（默认：发布包内 packs/ 或 .tmp/packs）
  */
 
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -53,34 +53,85 @@ function parseArgs(argv: readonly string[]): Options {
   return options
 }
 
-/** 定位 dsh CLI：显式路径 → 环境变量 → PATH → 便携包。 */
-function resolveDshCli(explicit?: string): { cli: string; node: string } {
+interface DshLauncher {
+  command: string
+  prefix: string[]
+  cli: string
+}
+
+function cliFileFromInput(input: string): string | undefined {
+  const fullPath = resolve(input)
+  const candidates = [
+    fullPath,
+    join(fullPath, 'apps', 'cli', 'lib', 'bin.js'),
+    join(fullPath, 'lib', 'bin.js'),
+    join(fullPath, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'),
+  ]
+  return candidates.find((candidate) => existsSync(candidate) && statSync(candidate).isFile())
+}
+
+function launcherFor(cli: string): DshLauncher {
+  if (/\.(?:c|m)?js$/i.test(cli)) return { command: process.execPath, prefix: [cli], cli }
+  if (process.platform === 'win32' && /\.(?:cmd|bat)$/i.test(cli)) {
+    return { command: process.env.ComSpec ?? 'cmd.exe', prefix: ['/d', '/s', '/c', cli], cli }
+  }
+  return { command: cli, prefix: [], cli }
+}
+
+function nearbySourceCli(): string | undefined {
+  const starts = [resolve(import.meta.dirname), resolve(process.cwd())]
+  const visited = new Set<string>()
+  for (const start of starts) {
+    let current = start
+    while (!visited.has(current)) {
+      visited.add(current)
+      const candidates = [
+        join(current, 'apps', 'cli', 'lib', 'bin.js'),
+        join(current, 'DeepseekHarness', 'apps', 'cli', 'lib', 'bin.js'),
+        join(current, 'DeepSeekHarness', 'apps', 'cli', 'lib', 'bin.js'),
+        join(current, 'deepseek-harness', 'apps', 'cli', 'lib', 'bin.js'),
+      ]
+      const found = candidates.find((candidate) => existsSync(candidate))
+      if (found !== undefined) return found
+      const parent = dirname(current)
+      if (parent === current) break
+      current = parent
+    }
+  }
+  return undefined
+}
+
+/** 定位 dsh CLI：显式路径 → 环境变量 → PATH → 相邻源码仓库 → 便携包。 */
+function resolveDshCli(explicit?: string): DshLauncher {
   if (explicit !== undefined) {
-    if (!existsSync(explicit)) throw new Error(`DSH CLI 不存在: ${explicit}`)
-    return { cli: explicit, node: process.execPath }
+    const cli = cliFileFromInput(explicit)
+    if (cli === undefined) throw new Error(`DSH CLI 不存在: ${resolve(explicit)}`)
+    return launcherFor(cli)
   }
   const fromEnv = process.env.DSHPLUSPLUS_DSH_CLI
-  if (fromEnv !== undefined && existsSync(fromEnv)) {
-    return { cli: fromEnv, node: process.execPath }
+  if (fromEnv !== undefined) {
+    const cli = cliFileFromInput(fromEnv)
+    if (cli !== undefined) return launcherFor(cli)
   }
   const fromPath = spawnSync(process.platform === 'win32' ? 'where' : 'which', ['dsh'], { encoding: 'utf8' })
   const pathHit = fromPath.status === 0 ? fromPath.stdout.split(/\r?\n/).find(Boolean) : undefined
-  if (pathHit !== undefined) {
-    return { cli: pathHit, node: process.execPath }
-  }
+  if (pathHit !== undefined) return launcherFor(resolve(pathHit))
+  const sourceCli = nearbySourceCli()
+  if (sourceCli !== undefined) return launcherFor(sourceCli)
   // 便携包：完整包布局 <root>/runtime/dsh + <root>/runtime/node 必须同时存在，
   // 否则视为未命中（避免向上误撞 workspace 根目录的 runtime/dsh 假阳性）。
-  const root = dirname(resolve(import.meta.dirname, '..'))
-  const portable = join(root, 'runtime', 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
-  const portableNode = join(root, 'runtime', 'node', process.platform === 'win32' ? 'node.exe' : 'node')
-  if (existsSync(portable) && existsSync(portableNode)) {
-    return { cli: portable, node: portableNode }
+  for (const root of [resolve(import.meta.dirname), resolve(import.meta.dirname, '..')]) {
+    const portable = join(root, 'runtime', 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')
+    const portableNode = join(root, 'runtime', 'node', process.platform === 'win32' ? 'node.exe' : 'node')
+    if (existsSync(portable) && existsSync(portableNode)) {
+      return { command: portableNode, prefix: [portable], cli: portable }
+    }
   }
   throw new Error(
     '未找到 DSH CLI。请任选其一：\n' +
       '  1) 确保 dsh 在 PATH 中；\n' +
-      '  2) 设置环境变量 DSHPLUSPLUS_DSH_CLI 指向 dsh 的 bin.js；\n' +
-      '  3) 通过 --dsh-cli <path> 参数显式指定。\n' +
+      '  2) 设置 DSHPLUSPLUS_DSH_CLI 指向 DSH 仓库或 bin.js；\n' +
+      '  3) 通过 --dsh-cli <DSH 仓库或 CLI 路径> 显式指定。\n' +
       '（Lite 包面向“已有 DeepSeek Harness”的用户；若还没有 DSH，请先安装 DSH，或改用自包含完整包。）',
   )
 }
@@ -106,22 +157,23 @@ function findTarballs(packsDir: string): string[] {
 
 function run(): void {
   const options = parseArgs(process.argv.slice(2))
-  const { cli, node } = resolveDshCli(options.dshCli)
+  const launcher = resolveDshCli(options.dshCli)
   const home = dshHome(options.home)
 
   // tarball 目录：--packs-dir → 发布包内 packs/ → .tmp/packs（绝对路径，
   // pnpm 在 profile 目录内运行，相对路径会被错误解析）。
-  const root = dirname(resolve(import.meta.dirname, '..'))
+  const packageRoot = resolve(import.meta.dirname)
+  const workspaceRoot = resolve(import.meta.dirname, '..')
   const packsDir = resolve(options.packsDir
-    ?? (existsSync(join(root, 'packs')) ? join(root, 'packs') : join(root, '.tmp', 'packs')))
+    ?? (existsSync(join(packageRoot, 'packs')) ? join(packageRoot, 'packs') : join(workspaceRoot, '.tmp', 'packs')))
   const tarballs = findTarballs(packsDir)
 
-  console.log(`[install] DSH CLI: ${cli}`)
+  console.log(`[install] DSH CLI: ${launcher.cli}`)
   console.log(`[install] DSH_HOME: ${home}`)
   console.log(`[install] profile: ${options.profile}`)
   console.log(`[install] tarballs: ${tarballs.map((t) => t.split(/[\\/]/).pop()).join(', ')}`)
 
-  const result = spawnSync(node, [cli, 'plugin', '--profile', options.profile, 'add', '--save-prod', ...tarballs], {
+  const result = spawnSync(launcher.command, [...launcher.prefix, 'plugin', '--profile', options.profile, 'add', '--save-prod', ...tarballs], {
     encoding: 'utf8',
     stdio: 'inherit',
     env: { ...process.env, DSH_HOME: home },
@@ -130,7 +182,7 @@ function run(): void {
   if (result.status !== 0) process.exit(result.status ?? 1)
 
   // 验证：dump-config 应包含 bundle-plus 层。
-  const check = spawnSync(node, [cli, '--profile', options.profile, '--dump-config'], {
+  const check = spawnSync(launcher.command, [...launcher.prefix, '--profile', options.profile, '--dump-config'], {
     encoding: 'utf8',
     env: { ...process.env, DSH_HOME: home },
   })
@@ -140,7 +192,10 @@ function run(): void {
   } else {
     console.log('[install] bundle-plus 已进入 profile 配置层 ✓')
   }
-  console.log(`[install] 完成。启动方式：dsh --profile ${options.profile}`)
+  const command = /\.(?:c|m)?js$/i.test(launcher.cli)
+    ? `"${launcher.command}" "${launcher.cli}"`
+    : `"${launcher.cli}"`
+  console.log(`[install] 完成。启动方式：${command} --profile ${options.profile}`)
 }
 
 try {

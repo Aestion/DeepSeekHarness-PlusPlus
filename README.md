@@ -4,7 +4,7 @@
 
 DeepSeek Harness（DSH）的增强层：为 DSH 补充**多模态视觉、网页读取/搜索与浏览器控制**能力，不修改、不注入、不替换 DSH 核心。基于 DSH 的 Profile/Bundle/Plugin/MCP 接口与外部 Sidecar 组合，升级边界和故障边界清晰。
 
-> 状态：`0.1.0-dev.1` · Windows x64 · 配套 DSH `0.1.0-rc.6`
+> 状态：`0.1.0-dev.2` · Windows x64 · 配套 DSH `0.1.0-rc.6`
 
 > **仓库范围**：本仓库**只包含 DSH++ 层**。DeepSeek Harness 核心是上游依赖（DeepSeek 官方发布的 `@deepseek-ai/dsh`），由用户安装时从 npm registry 获取——DSH 代码、依赖树或捆绑副本不会出现在本仓库或任何发布包中。GitHub Release 只发布 DSH++ 自身的产物：Lite 插件包（约 26 KB）与自包含桌面版（约 149 MB，控制中心 + Node + MCA + DSH++ 插件，**不含 DSH 本体**——exe 发现本地 DSH，缺失时引导安装）。支持的 DSH 上游版本见 [compatibility.json](runtime/manifests/compatibility.json)。
 
@@ -51,7 +51,7 @@ DeepSeek Harness（DSH）的增强层：为 DSH 补充**多模态视觉、网页
 
 **方式 A — Lite 插件包（推荐，几 MB）。** 已经装有 DeepSeek Harness？下载 **Lite** 版 Release 资产（`DSHPlusPlus-lite-*.zip`，约 30 KB）：只含五个插件包 + 一键安装器，装进你已有的 DSH Profile——**不携带 Node/DSH/MCA 运行时**。要求：Node.js 22+、pnpm、`dsh` 在 PATH 中。解压后运行「安装到已有DSH.cmd」（或 `node install.mjs`），用 `dsh --profile dshplusplus` 启动。完整参数见「使用说明.md」。
 
-**方式 B — 自包含桌面版。** 下载 Release 资产 `DSHPlusPlus-0.1.0-dev.1-windows-x64.zip`（约 149 MB）解压即可。**不捆绑 DeepSeek Harness**——控制中心发现本地 DSH（PATH / npm 全局 / 手动指定 CLI 路径）并代为启动；未安装 DSH 时控制中心照常可用，显示引导横幅 + 「获取 DSH」按钮（打开官方安装指引）。内置 Node、MCA 与 DSH++ 插件。DSH 数据存放于标准 dsh home（`~/.dsh`）；`.portable` 目录只放 DSH++ 自身的配置、日志与 Sidecar 数据。在控制中心按需配置视觉模型（多模态专家），点击**启动 DSH**，在 DSH 的 `设置 → 模型` 配置主模型，然后发送一张图片——它会被视觉模型描述并投影进对话。
+**方式 B — 自包含桌面版。** 下载 Release 资产 `DSHPlusPlus-0.1.0-dev.2-windows-x64.zip`（约 149 MB）解压即可。**不捆绑 DeepSeek Harness**——控制中心会从环境变量、PATH、npm/pnpm 全局目录及相邻的 `DeepSeekHarness` 源码仓库发现本地 DSH 并代为启动。自动发现失败时，点击「选择已有 DSH」，可选择仓库根目录或在「运行环境」中指定 `apps\cli`、`lib`、`bin.js`、`dsh.cmd`、`dsh.exe`。未安装 DSH 时控制中心照常可用，「获取 DSH」可打开官方安装指引。内置 Node、MCA 与 DSH++ 插件。DSH 数据存放于标准 dsh home（`~/.dsh`）；`.portable` 目录只放 DSH++ 自身的配置、日志与 Sidecar 数据。在控制中心按需配置视觉模型（多模态专家），点击**启动 DSH**，在 DSH 的 `设置 → 模型` 配置主模型，然后发送一张图片——它会被视觉模型描述并投影进对话。
 
 ## 作为插件安装到已有 DSH
 

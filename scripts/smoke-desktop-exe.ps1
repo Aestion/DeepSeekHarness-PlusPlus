@@ -14,6 +14,7 @@ param(
 #   指向隔离目录，避免污染真实 DSH 数据（也会跳过便携数据迁移）。
 
 $ErrorActionPreference = 'Stop'
+$Stage = [System.IO.Path]::GetFullPath($Stage)
 $exe = Join-Path $Stage 'DSHPlusPlus.exe'
 $app = $null
 $mcaBefore = Get-NetTCPConnection -LocalPort 18765 -State Listen -ErrorAction SilentlyContinue

@@ -287,7 +287,7 @@ export class BrowserMcpServer {
         result: {
           protocolVersion: '2025-03-26',
           capabilities: { tools: {} },
-          serverInfo: { name: 'DSH++ Browser Gateway', version: '0.1.0-dev.1' },
+          serverInfo: { name: 'DSH++ Browser Gateway', version: '0.1.0-dev.2' },
         },
       })
       return
