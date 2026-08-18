@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Stage = (Join-Path (Split-Path -Parent $PSScriptRoot) 'release')
 )
 
@@ -16,7 +16,7 @@ try {
     New-Item -ItemType Directory -Force -Path $mcaData | Out-Null
     $mca = Start-Process `
         -FilePath (Join-Path $Stage 'runtime\mca\mca-runtime.exe') `
-        -ArgumentList @('serve', '--host', '127.0.0.1', '--port', '18765', '--data', $mcaData) `
+        -ArgumentList @('serve', '--host', '127.0.0.1', '--port', '18767', '--data', $mcaData) `
         -WorkingDirectory $Stage `
         -WindowStyle Hidden `
         -RedirectStandardOutput $mcaOut `
@@ -26,7 +26,7 @@ try {
     $mcaReady = $false
     for ($index = 0; $index -lt 60; $index++) {
         try {
-            $health = Invoke-RestMethod -Uri 'http://127.0.0.1:18765/api/health' -TimeoutSec 1
+            $health = Invoke-RestMethod -Uri 'http://127.0.0.1:18767/api/health' -TimeoutSec 1
             if ($health.status -eq 'ok') { $mcaReady = $true; break }
         } catch {}
         Start-Sleep -Milliseconds 250
@@ -47,7 +47,7 @@ try {
     } | ConvertTo-Json
     $route = Invoke-RestMethod `
         -Method Put `
-        -Uri 'http://127.0.0.1:18765/api/agent-routes/deepseek-tui' `
+        -Uri 'http://127.0.0.1:18767/api/agent-routes/deepseek-tui' `
         -ContentType 'application/json' `
         -Body $routeBody `
         -TimeoutSec 15

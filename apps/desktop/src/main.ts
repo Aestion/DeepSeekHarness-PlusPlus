@@ -201,7 +201,7 @@ app.innerHTML = `
               <span class="switch compact"><input type="checkbox" id="mca-computer-act" data-mca-capability><span></span></span>
             </label>
           </div>
-          <p class="capability-note" id="computer-hint">电脑能力默认关闭；启用后仍受 MCA 的风险等级、确认策略与本机自动化运行环境约束。</p>
+          <p class="capability-note" id="computer-hint">电脑能力默认开启；操作仍受 MCA 的风险等级、确认策略与本机自动化运行环境约束。</p>
           <div class="card-actions computer-actions">
             <button class="button outline" id="enable-computer-provider">启用电脑 Provider</button>
             <span class="capability-note" id="computer-provider-hint">先启动 MCA，再启用观察和操作。</span>

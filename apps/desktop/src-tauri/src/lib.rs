@@ -17,7 +17,9 @@ use tauri::{Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 /// 统一版本号：由 build.rs 从根 package.json 注入（单一来源）。
 const VERSION: &str = include_str!(concat!(env!("OUT_DIR"), "/version.txt"));
-const MCA_PORT: u16 = 18765;
+/// DSH++ 自带 MCA 的专属端口：与 MCA 官方默认口及独立 MCA Control
+/// Center（本机 8766）错开，互不收编、互不探测。
+const MCA_PORT: u16 = 18767;
 /// DSH++ browser gateway (CDP-managed Chrome + shared-tab bridge).
 const BROWSER_PORT: u16 = 18766;
 /// Label of the embedded DSH desktop window (WebView2, loads the DSH web UI).
@@ -80,8 +82,8 @@ impl Default for StoredConfig {
             mca_audio: true,
             mca_document: true,
             mca_web: true,
-            mca_computer_observe: false,
-            mca_computer_act: false,
+            mca_computer_observe: true,
+            mca_computer_act: true,
             deepseek_base_url: "https://api.deepseek.com".into(),
             deepseek_model: "deepseek-chat".into(),
             deepseek_secret: None,
@@ -805,10 +807,15 @@ fn config_path(runtime: &RuntimePaths) -> PathBuf {
 }
 
 fn load_config(runtime: &RuntimePaths) -> StoredConfig {
-    fs::read_to_string(config_path(runtime))
+    let mut config: StoredConfig = fs::read_to_string(config_path(runtime))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // 电脑能力属于开箱即用范围：历史配置保存的 false 一律归一化为 true，
+    // 避免旧配置落进“开关禁用 ↔ Provider 未启用”的死锁。
+    config.mca_computer_observe = true;
+    config.mca_computer_act = true;
+    config
 }
 
 fn write_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
@@ -1468,7 +1475,7 @@ fn fetch_mca_providers() -> Vec<McaProviderView> {
         .build()
         .into();
     let Ok(body) = agent
-        .get("http://127.0.0.1:18765/api/providers")
+        .get(&format!("http://127.0.0.1:{MCA_PORT}/api/providers"))
         .call()
         .map(|mut response| response.body_mut().read_to_string())
     else {
@@ -1520,7 +1527,7 @@ fn fetch_mca_route() -> Option<McaRouteView> {
         .build()
         .into();
     let body = agent
-        .get("http://127.0.0.1:18765/api/agent-routes")
+        .get(&format!("http://127.0.0.1:{MCA_PORT}/api/agent-routes"))
         .call()
         .ok()?
         .body_mut()
@@ -1756,6 +1763,18 @@ fn ensure_agent_shims(state: &AppState, config: &StoredConfig) -> Option<PathBuf
     Some(dir)
 }
 
+/// 向 MCA 请求启用桌面自动化 Provider。无条件可用（不依赖已保存的
+/// 能力勾选），是“电脑开关禁用 ↔ Provider 未启用”死锁的唯一出口。
+fn enable_desktop_provider(agent: &ureq::Agent, port: u16) -> Result<(), String> {
+    agent
+        .post(&format!(
+            "http://127.0.0.1:{port}/api/providers/wheel.pyautogui-desktop/state"
+        ))
+        .send_json(json!({ "enabled": true }))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 fn configure_mca_route(
     state: &AppState,
     config: &StoredConfig,
@@ -1800,11 +1819,11 @@ fn configure_mca_route(
     }
     // 电脑能力需要 MCA 桌面自动化 Provider（默认禁用）。保留服务端
     // 返回结果，避免 Provider 启动失败时仍把 computer.* 报成可用。
-    if capabilities.iter().any(|capability| capability.starts_with("computer.")) {
-        let provider_url = format!(
-            "http://127.0.0.1:{MCA_PORT}/api/providers/wheel.pyautogui-desktop/state"
-        );
-        if let Err(error) = agent.post(&provider_url).send_json(json!({ "enabled": true })) {
+    if capabilities
+        .iter()
+        .any(|capability| capability.starts_with("computer."))
+    {
+        if let Err(error) = enable_desktop_provider(&agent, MCA_PORT) {
             let mut service = state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?;
             service.message = format!("电脑 Provider 启用失败：{error}");
         }
@@ -2487,8 +2506,31 @@ fn enable_computer_provider(state: State<'_, AppState>) -> Result<AppSnapshot, S
     if !port_open("127.0.0.1", MCA_PORT) {
         return Err("MCA 尚未运行，请先点击“启动 DSH”启动能力层".into());
     }
+    // 先无条件启用桌面 Provider：不能依赖配置里的能力勾选——开关被禁用
+    // 正是因为 Provider 未启用，依赖勾选会形成死锁。
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .into();
+    enable_desktop_provider(&agent, MCA_PORT)?;
     configure_mca_route(&state, &config, true)?;
     snapshot(&state)
+}
+
+/// `mca-runtime serve` 的固定参数（数据目录由调用方追加在 --data 之后）。
+/// --agent-base-url 指向自己：路由健康探测不再落到外部 MCA 实例
+/// （如独立 MCA Control Center 的 8766）上。
+fn mca_serve_args(port: u16) -> Vec<String> {
+    vec![
+        "serve".into(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        port.to_string(),
+        "--agent-base-url".into(),
+        format!("http://127.0.0.1:{port}"),
+        "--data".into(),
+    ]
 }
 
 fn start_mca(state: &AppState, config: &StoredConfig) -> Result<(), String> {
@@ -2508,16 +2550,10 @@ fn start_mca(state: &AppState, config: &StoredConfig) -> Result<(), String> {
         fs::create_dir_all(&data).map_err(|error| error.to_string())?;
         let (stdout, stderr) = log_files(&state.runtime, "mca")?;
         let mut command = Command::new(binary);
+        let mut args = mca_serve_args(MCA_PORT);
+        args.push(data.to_string_lossy().into_owned());
         command
-            .args([
-                "serve",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &MCA_PORT.to_string(),
-                "--data",
-            ])
-            .arg(&data)
+            .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
@@ -3579,6 +3615,12 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+    }
+
     /// agent shim 内容：包含默认 profile 注入与 mcp 子命令仿真，
     /// launcher（node+bin.js 或独立 exe）原样嵌入。
     #[test]
@@ -3881,5 +3923,124 @@ llm-deepseek:
         assert_eq!(settings["agent-default-model"]["provider"], "deepseek-plus");
         assert_eq!(settings["agent-default-model"]["model"], "deepseek-v4-pro");
         assert_eq!(settings["agent-default-model"]["reasoningEffort"], "max");
+    }
+
+    /// 电脑能力（观察/操作）默认开启：开箱即用，安全由 MCA 侧
+    /// 风险等级与逐次确认兜底。
+    #[test]
+    fn computer_capabilities_default_on() {
+        let config = StoredConfig::default();
+        assert!(config.mca_computer_observe, "观察电脑应默认开启");
+        assert!(config.mca_computer_act, "操作电脑应默认开启");
+    }
+
+    /// 历史配置中保存的 false 在加载时归一化为 true：
+    /// 避免旧配置落进“开关禁用 ↔ Provider 未启用”的死锁。
+    #[test]
+    fn load_config_forces_computer_capabilities_on() {
+        let tmp = TempDir::new("cfg-force-computer");
+        let runtime = RuntimePaths {
+            portable: true,
+            data_root: tmp.path().join("data"),
+            dsh_home: None,
+            node: None,
+            dsh_cli: None,
+            plugins_dir: None,
+            mca: None,
+            browser_gateway: None,
+        };
+        write(
+            &runtime.data_root.join("dshplusplus.json"),
+            r#"{"dshPort":18760,"mcaComputerObserve":false,"mcaComputerAct":false}"#,
+        );
+        let config = load_config(&runtime);
+        assert!(config.mca_computer_observe, "加载后观察电脑应被强制开启");
+        assert!(config.mca_computer_act, "加载后操作电脑应被强制开启");
+    }
+
+    /// MCA 使用 DSH++ 专属端口（18767，紧邻 BROWSER_PORT），并把
+    /// agent-base-url 指向自己：与独立 MCA Control Center（8766）互不探测。
+    #[test]
+    fn mca_serve_args_use_dedicated_port_and_self_agent_base_url() {
+        assert_eq!(MCA_PORT, 18767, "MCA 端口必须是 DSH++ 专属端口");
+        let args = mca_serve_args(MCA_PORT);
+        let flag = |name: &str| {
+            args.iter()
+                .position(|arg| arg == name)
+                .unwrap_or_else(|| panic!("serve 参数缺少 {name}"))
+                + 1
+        };
+        assert_eq!(args[0], "serve");
+        assert_eq!(args[flag("--port")], "18767");
+        assert_eq!(
+            args[flag("--agent-base-url")],
+            "http://127.0.0.1:18767",
+            "健康探测必须指向自己，而非外部 MCA 的 8766"
+        );
+    }
+
+    /// enable_desktop_provider 必须向桌面 Provider 状态端点 POST enabled=true：
+    /// 这是解开电脑开关死锁的出口（无需依赖已保存的能力勾选）。
+    #[test]
+    fn enable_desktop_provider_posts_enabled_true() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // 完整读完请求（头 + Content-Length 指定的体）再应答：
+            // 残留未读数据会在连接关闭时触发 RST，中断客户端读响应。
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(header_end) = find_subsequence(&buffer, b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| line.split_once(':').and_then(|(name, value)| {
+                            (name.trim().eq_ignore_ascii_case("content-length"))
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        }))
+                        .unwrap_or(0);
+                    if buffer.len() >= header_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            let request = String::from_utf8_lossy(&buffer).into_owned();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+            request
+        });
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build()
+            .into();
+        enable_desktop_provider(&agent, port).expect("启用请求应成功");
+        let request = server.join().unwrap();
+        assert!(
+            request.starts_with("POST /api/providers/wheel.pyautogui-desktop/state"),
+            "请求行应命中桌面 Provider 状态端点，实际：{}",
+            request.lines().next().unwrap_or_default()
+        );
+        let body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .unwrap_or_default();
+        let payload: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|error| panic!("请求体应为 JSON，实际：{body}（{error}）"));
+        assert_eq!(
+            payload["enabled"], serde_json::Value::Bool(true),
+            "请求体应为 enabled=true"
+        );
     }
 }

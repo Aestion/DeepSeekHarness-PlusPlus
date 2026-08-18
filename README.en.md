@@ -33,7 +33,7 @@ An enhancement layer for [DeepSeek Harness](https://github.com/deepseek-ai/DeepS
 └──────────────┬───────────────────────────────┬───────────────┘
                │ spawn local dsh               │ spawn
 ┌──────────────▼───────────────┐   ┌──────────▼────────────────┐
-│ DeepSeek Harness (local)     │   │ MCA sidecar (18765)       │
+│ DeepSeek Harness (local)     │   │ MCA sidecar (18767)       │
 │  · @dshplusplus/multimodal   │   │  image/video/audio/doc/   │
 │  · multimodal-router         │   │  web/computer providers   │
 │  · tool-media-inspect        │   │  (system-proxy aware)     │

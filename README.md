@@ -33,7 +33,7 @@ DeepSeek Harness（DSH）的增强层：为 DSH 补充**多模态视觉、网页
 └──────────────┬───────────────────────────────┬───────────────┘
                │ 拉起本地 dsh                 │ 拉起
 ┌──────────────▼───────────────┐   ┌──────────▼────────────────┐
-│ DeepSeek Harness（本地）     │   │ MCA Sidecar（18765）       │
+│ DeepSeek Harness（本地）     │   │ MCA Sidecar（18767）       │
 │  · @dshplusplus/multimodal   │   │  image/video/audio/doc/   │
 │  · multimodal-router         │   │  web/computer 各 Provider │
 │  · tool-media-inspect        │   │  （跟随系统代理）          │
