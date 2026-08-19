@@ -208,12 +208,18 @@ describe('multimodal router with the real DSH agent loop', () => {
     await agent.whenIdle()
     expect(approval?.asks).toHaveLength(1)
     expect(getInspections()).toBe(1)
-    // 会话事件流里应留下审计配对
-    const asked = agent.session.events.filter(event => event.type === 'approval/asked')
-    const decided = agent.session.events.filter(event => event.type === 'approval/decided')
+    // 会话事件流里应留下审计配对。rc.7 的 SessionEventMap 不包含 approval 事件类型
+    //（运行时 KNOWN_SESSION_EVENT_TYPES 仍接受它们），按插件 visionApprovalGranted
+    // 的相同方式以原始形状读取。
+    const audit = agent.session.events as readonly {
+      type?: string
+      data?: { id?: string; outcome?: string }
+    }[]
+    const asked = audit.filter(event => event.type === 'approval/asked')
+    const decided = audit.filter(event => event.type === 'approval/decided')
     expect(asked).toHaveLength(1)
     expect(decided).toHaveLength(1)
-    expect(decided[0]?.data.outcome).toBe('allowed-once')
+    expect(decided[0]?.data?.outcome).toBe('allowed-once')
 
     // 同一会话第二次发图：不再询问（ask-once 记住授权）
     agent.followup(imageMessage())

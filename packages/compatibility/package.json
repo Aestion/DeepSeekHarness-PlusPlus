@@ -25,6 +25,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
+    "@deepseek-ai/dsh-mcp-client": "0.1.0-rc.7",
     "@dshplusplus/multimodal": "workspace:*",
     "@types/node": "22.20.0"
   }
