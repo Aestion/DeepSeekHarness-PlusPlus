@@ -296,6 +296,8 @@ struct AppState {
     dsh: Mutex<ManagedChild>,
     mca: Mutex<ManagedChild>,
     browser: Mutex<ManagedChild>,
+    /// chromeUse 扩展安装状态扫描缓存（时间戳 + 结果，3 秒 TTL）。
+    extension_status: Mutex<Option<(Instant, ChromeExtensionView)>>,
     runtime: RuntimePaths,
 }
 
@@ -315,24 +317,17 @@ impl Drop for AppState {
 }
 
 #[cfg(target_os = "windows")]
-fn open_url(url: &str) -> Result<(), String> {
-    Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .spawn()
-        .map_err(|error| format!("无法打开页面：{error}"))?;
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
 fn unregister_chrome_native_host() {
-    let mut command = Command::new("reg");
-    command.args([
-        "delete",
+    // Chrome 与 Edge 两个键都注销（指向同一份 host manifest）。
+    for root in [
         r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.dshplusplus.browser",
-        "/f",
-    ]);
-    hide_console(&mut command);
-    let _ = command.output();
+        r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.dshplusplus.browser",
+    ] {
+        let mut command = Command::new("reg");
+        command.args(["delete", root, "/f"]);
+        hide_console(&mut command);
+        let _ = command.output();
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -373,6 +368,8 @@ struct AppSnapshot {
     browser_state: ServiceState,
     browser_pid: Option<u32>,
     browser_message: String,
+    /// chromeUse 扩展在 Chrome / Edge 的安装四态与桥连接状态。
+    chrome_extension: ChromeExtensionView,
 }
 
 /// MCA deepseek-tui 路由的实时能力与健康视图（供 UI 动态化能力开关）。
@@ -1995,6 +1992,8 @@ fn prepare_chrome_extension(state: &AppState) -> Result<PathBuf, String> {
     }
 
     // Host manifest registered under HKCU NativeMessagingHosts.
+    // Chrome 与 Edge 读各自的键，但指向同一份 host-manifest.json / launcher
+    // （扩展 ID 由 manifest key 派生，两个浏览器一致）。
     let manifest_path = destination.join("host-manifest.json");
     let manifest = json!({
         "name": "com.dshplusplus.browser",
@@ -2009,22 +2008,22 @@ fn prepare_chrome_extension(state: &AppState) -> Result<PathBuf, String> {
             .map_err(|error| error.to_string())?
             .as_bytes(),
     )?;
-    let registration = Command::new("reg")
-        .args([
-            "add",
-            r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.dshplusplus.browser",
-            "/ve",
-            "/d",
-            &path_string(&manifest_path),
-            "/f",
-        ])
-        .output()
-        .map_err(|error| format!("注册 Native Messaging 主机失败：{error}"))?;
-    if !registration.status.success() {
-        return Err(format!(
-            "注册表写入失败：{}",
-            String::from_utf8_lossy(&registration.stderr)
-        ));
+    for root in [
+        r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.dshplusplus.browser",
+        r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.dshplusplus.browser",
+    ] {
+        let mut registration = Command::new("reg");
+        registration.args(["add", root, "/ve", "/d", &path_string(&manifest_path), "/f"]);
+        hide_console(&mut registration);
+        let output = registration
+            .output()
+            .map_err(|error| format!("注册 Native Messaging 主机失败：{error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "注册表写入失败：{}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
     }
     Ok(destination)
 }
@@ -2040,6 +2039,231 @@ fn auto_activate_chrome_use(state: &AppState) -> String {
         Err(error) => format!("chromeUse 扩展准备失败：{error}"),
     }
 }
+
+/// chromeUse 扩展固定 ID（manifest key 派生，Chrome 与 Edge 一致）。
+const EXTENSION_ID: &str = "kikoigbglcakhdeknllbinnaepdaoofh";
+
+/// 扩展在某浏览器中的安装四态。
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "kebab-case")]
+enum ExtensionInstallState {
+    NotInstalled,
+    Installed,
+    Stale,
+    Disabled,
+}
+
+/// 多 profile 归并优先级：健康记录压过禁用，禁用压过失效。
+fn extension_state_rank(state: ExtensionInstallState) -> u8 {
+    match state {
+        ExtensionInstallState::NotInstalled => 0,
+        ExtensionInstallState::Stale => 1,
+        ExtensionInstallState::Disabled => 2,
+        ExtensionInstallState::Installed => 3,
+    }
+}
+
+/// 单条 profile 扩展记录的四态判定。禁用（state:0 / disable_reasons）
+/// 优先；其次路径校验：记录 path 目录必须存在且含 manifest.json，
+/// 且 version/key 与当前数据根的扩展 manifest 一致，不一致视为失效
+/// （如旧版本残留目录被删除后的残影记录）。
+fn classify_extension_record(
+    record: &serde_json::Value,
+    expected: Option<&serde_json::Value>,
+) -> ExtensionInstallState {
+    let disabled = record.get("state").and_then(serde_json::Value::as_i64) == Some(0)
+        || record
+            .get("disable_reasons")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|reasons| !reasons.is_empty());
+    if disabled {
+        return ExtensionInstallState::Disabled;
+    }
+    let Some(path) = record.get("path").and_then(serde_json::Value::as_str) else {
+        return ExtensionInstallState::Stale;
+    };
+    let Ok(content) = fs::read_to_string(Path::new(path).join("manifest.json")) else {
+        return ExtensionInstallState::Stale;
+    };
+    let Ok(actual) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return ExtensionInstallState::Stale;
+    };
+    if let Some(expected) = expected {
+        for field in ["version", "key"] {
+            if actual.get(field) != expected.get(field) {
+                return ExtensionInstallState::Stale;
+            }
+        }
+    }
+    ExtensionInstallState::Installed
+}
+
+/// 扫描一个浏览器 user-data 目录下全部 profile（Default / Profile N）
+/// 的 Preferences 与 Secure Preferences，归并四态并带回首个命中记录的
+/// profile 名与扩展路径。无任何记录时返回 NotInstalled。
+fn scan_browser_extension(
+    user_data: &Path,
+    expected: Option<&serde_json::Value>,
+) -> (ExtensionInstallState, Option<String>, Option<String>) {
+    let mut best: Option<(ExtensionInstallState, String, String)> = None;
+    let Ok(entries) = fs::read_dir(user_data) else {
+        return (ExtensionInstallState::NotInstalled, None, None);
+    };
+    let mut profiles: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name == "Default" || name.starts_with("Profile ")
+        })
+        .map(|entry| entry.path())
+        .collect();
+    profiles.sort();
+    for profile in profiles {
+        let profile_name = profile
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for file in ["Secure Preferences", "Preferences"] {
+            let Ok(content) = fs::read_to_string(profile.join(file)) else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) else {
+                continue;
+            };
+            let Some(record) = parsed
+                .get("extensions")
+                .and_then(|extensions| extensions.get("settings"))
+                .and_then(|settings| settings.get(EXTENSION_ID))
+            else {
+                continue;
+            };
+            let status = classify_extension_record(record, expected);
+            if best
+                .as_ref()
+                .is_none_or(|(current, _, _)| extension_state_rank(status) > extension_state_rank(*current))
+            {
+                let path = record
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from);
+                best = Some((status, profile_name.clone(), path.unwrap_or_default()));
+            }
+        }
+    }
+    match best {
+        Some((status, profile, path)) => (status, Some(profile), Some(path)),
+        None => (ExtensionInstallState::NotInstalled, None, None),
+    }
+}
+
+/// 单个浏览器的扩展状态（UI 状态行渲染用）。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct BrowserExtensionStatus {
+    browser: String,
+    status: ExtensionInstallState,
+    profile: Option<String>,
+    path: Option<String>,
+    connected: bool,
+}
+
+/// 双浏览器扩展状态视图（并入 AppSnapshot，UI 轮询自动更新）。
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ChromeExtensionView {
+    chrome: BrowserExtensionStatus,
+    edge: BrowserExtensionStatus,
+}
+
+/// 浏览器 user-data 目录（%LOCALAPPDATA% 下 Chrome / Edge 标准布局）。
+fn browser_user_data_dir(browser: &str) -> Option<PathBuf> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    let sub = match browser {
+        "edge" => r"Microsoft\Edge\User Data",
+        _ => r"Google\Chrome\User Data",
+    };
+    Some(Path::new(&local).join(sub))
+}
+
+/// 期望的扩展 manifest：优先数据根 browser-extension/（安装目标），
+/// 缺失时回退 exe 自带的 runtime/browser/extension/。
+fn expected_extension_manifest(runtime: &RuntimePaths) -> Option<serde_json::Value> {
+    let mut candidates = vec![runtime.data_root.join("browser-extension/manifest.json")];
+    if let Some(source) = extension_source(runtime) {
+        candidates.push(source.join("manifest.json"));
+    }
+    candidates
+        .into_iter()
+        .find_map(|path| fs::read_to_string(path).ok())
+        .and_then(|content| serde_json::from_str(&content).ok())
+}
+
+/// 共享桥是否在线：网关 /api/health 的 shared.connected（浏览器运行 +
+/// 扩展加载 + native host 通）。网关未运行时直接 false，不发请求。
+fn fetch_shared_connected() -> bool {
+    if !port_open("127.0.0.1", BROWSER_PORT) {
+        return false;
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(2)))
+        .build()
+        .into();
+    agent
+        .get(&format!("http://127.0.0.1:{BROWSER_PORT}/api/health"))
+        .call()
+        .ok()
+        .and_then(|mut response| response.body_mut().read_to_string().ok())
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .and_then(|health| {
+            health
+                .get("shared")
+                .and_then(|shared| shared.get("connected"))
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+/// 全量扫描双浏览器扩展状态（无缓存；缓存包装见 cached_extension_status）。
+fn scan_extension_statuses(state: &AppState) -> ChromeExtensionView {
+    let expected = expected_extension_manifest(&state.runtime);
+    let connected = fetch_shared_connected();
+    let one = |browser: &str| {
+        let (status, profile, path) = match browser_user_data_dir(browser) {
+            Some(dir) if dir.is_dir() => scan_browser_extension(&dir, expected.as_ref()),
+            _ => (ExtensionInstallState::NotInstalled, None, None),
+        };
+        BrowserExtensionStatus {
+            browser: browser.to_string(),
+            status,
+            profile,
+            path,
+            connected,
+        }
+    };
+    ChromeExtensionView {
+        chrome: one("chrome"),
+        edge: one("edge"),
+    }
+}
+
+/// 扩展状态扫描缓存（3 秒）：UI 每 1.5s 轮询 snapshot，而 Secure
+/// Preferences 可达数 MB，避免反复解析；安装动作结束后主动清空。
+fn cached_extension_status(state: &AppState) -> ChromeExtensionView {
+    const TTL: Duration = Duration::from_secs(3);
+    let mut cache = match state.extension_status.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some((at, statuses)) = cache.as_ref() {
+        if at.elapsed() < TTL {
+            return statuses.clone();
+        }
+    }
+    let statuses = scan_extension_statuses(state);
+    *cache = Some((Instant::now(), statuses.clone()));
+    statuses
+}
+
 
 /// 组件更新状态（DSH++ / 插件 / MCA / DSH 通用）。
 #[derive(Serialize)]
@@ -2472,19 +2696,86 @@ fn open_dsh_guide() -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn install_chrome_extension(state: State<'_, AppState>) -> Result<String, String> {
-    let destination = prepare_chrome_extension(&state)?;
-    let destination_text = path_string(&destination);
-    // Chrome 137+ blocks the old command-line loading path for normal profiles.
-    // Open the exact extensions page and copy the directory so the one required
-    // confirmation is reduced to a single paste-and-select action.
-    let _ = open_url("chrome://extensions");
+/// 浏览器可执行文件：Program Files / Program Files (x86) / LOCALAPPDATA
+/// 下的标准安装位置。
+fn browser_executable(browser: &str) -> Option<PathBuf> {
+    let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+    let program_files_x86 = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from);
+    let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    match browser {
+        "edge" => {
+            if let Some(path) = &program_files_x86 {
+                candidates.push(path.join(r"Microsoft\Edge\Application\msedge.exe"));
+            }
+            if let Some(path) = &program_files {
+                candidates.push(path.join(r"Microsoft\Edge\Application\msedge.exe"));
+            }
+        }
+        _ => {
+            if let Some(path) = &program_files {
+                candidates.push(path.join(r"Google\Chrome\Application\chrome.exe"));
+            }
+            if let Some(path) = &program_files_x86 {
+                candidates.push(path.join(r"Google\Chrome\Application\chrome.exe"));
+            }
+            if let Some(path) = &local {
+                candidates.push(path.join(r"Google\Chrome\Application\chrome.exe"));
+            }
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// 目标浏览器进程是否正在运行（tasklist 按映像名过滤）。
+fn browser_process_running(browser: &str) -> bool {
+    let image = match browser {
+        "edge" => "msedge.exe",
+        _ => "chrome.exe",
+    };
+    let mut command = Command::new("tasklist");
+    command.args(["/FI", &format!("IMAGENAME eq {image}"), "/FO", "CSV", "/NH"]);
+    hide_console(&mut command);
+    match command.output() {
+        Ok(output) => String::from_utf8_lossy(&output.stdout)
+            .to_lowercase()
+            .contains(image),
+        Err(_) => false,
+    }
+}
+
+/// 轮询共享桥连接状态，最多 timeout（浏览器启动 + 扩展 service worker
+/// 唤醒 + native host 拉起需要数秒）。
+fn wait_shared_connected(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if fetch_shared_connected() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    false
+}
+
+/// 回退引导：打开目标浏览器的扩展管理页，并把扩展目录复制到剪贴板，
+/// 把 Chromium 安全边界要求的唯一一次手动操作压缩成“粘贴 + 确认”。
+fn extension_guidance(browser: &str, executable: &Path, destination: &Path) -> String {
+    let page = match browser {
+        "edge" => "edge://extensions",
+        _ => "chrome://extensions",
+    };
+    let browser_label = match browser {
+        "edge" => "Edge",
+        _ => "Chrome",
+    };
+    let _ = Command::new(executable).arg(page).spawn();
+    let destination_text = path_string(destination);
     let mut clipboard = Command::new("clip");
     clipboard
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    hide_console(&mut clipboard);
     if let Ok(mut child) = clipboard.spawn() {
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
@@ -2492,9 +2783,87 @@ fn install_chrome_extension(state: State<'_, AppState>) -> Result<String, String
         }
         let _ = child.wait();
     }
-    Ok(format!(
-        "扩展文件已准备：{destination_text}\nChrome 扩展页面已打开，已将目录复制到剪贴板。请开启“开发者模式”，点击“加载已解压的扩展程序”，粘贴目录并确认；然后刷新目标页面。"
-    ))
+    format!(
+        "{browser_label} 扩展页面已打开，扩展目录已复制到剪贴板。请开启“开发者模式”，点击“加载已解压的扩展程序”，粘贴目录并确认；加载一次后永久生效。"
+    )
+}
+
+/// 一键安装/修复/连接 chromeUse 扩展。按目标浏览器的实时安装态分派：
+/// - installed：拉起（或复用）浏览器让桥自动连接；
+/// - 其余三态：浏览器未运行时以 --load-extension 拉起（旧版浏览器直接
+///   生效）；Chrome/Edge 137+ 拦截命令行加载，轮询桥连接失败后回退
+///   「扩展页 + 剪贴板」引导，加载一次后永久持久化。
+#[tauri::command]
+fn install_chrome_extension(
+    state: State<'_, AppState>,
+    browser: Option<String>,
+) -> Result<String, String> {
+    let browser = match browser.as_deref() {
+        Some("edge") => "edge",
+        _ => "chrome",
+    };
+    let browser_label = match browser {
+        "edge" => "Edge",
+        _ => "Chrome",
+    };
+    // 桥连接的前提是网关在线；未运行时先拉起（chromeUse 启动流程同款）。
+    if !port_open("127.0.0.1", BROWSER_PORT) {
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| "配置状态锁已损坏")?
+            .clone();
+        start_browser(&state, &config)?;
+    }
+    let destination = prepare_chrome_extension(&state)?;
+    let exe = browser_executable(browser)
+        .ok_or_else(|| format!("未找到{browser_label}，请先安装{browser_label}"))?;
+
+    let user_data = browser_user_data_dir(browser);
+    let expected = expected_extension_manifest(&state.runtime);
+    let (status, _, _) = match &user_data {
+        Some(dir) if dir.is_dir() => scan_browser_extension(dir, expected.as_ref()),
+        _ => (ExtensionInstallState::NotInstalled, None, None),
+    };
+    let running = browser_process_running(browser);
+    let message = match status {
+        ExtensionInstallState::Installed => {
+            if !running {
+                let _ = Command::new(&exe).spawn();
+            }
+            if wait_shared_connected(Duration::from_secs(8)) {
+                format!("{browser_label} 扩展已连接，可以在已打开的标签页中使用了。")
+            } else {
+                format!("{browser_label} 扩展已安装；浏览器启动后扩展会自动连接，稍候状态会更新为“已连接”。")
+            }
+        }
+        _ => {
+            if running {
+                // 命令行参数对已运行实例无效，直接引导。
+                extension_guidance(browser, &exe, &destination)
+            } else {
+                let _ = Command::new(&exe)
+                    .arg(format!("--load-extension={}", path_string(&destination)))
+                    .spawn();
+                if wait_shared_connected(Duration::from_secs(8)) {
+                    format!("{browser_label} 扩展已加载并连接。若状态仍显示未安装，请在扩展管理页“加载已解压”一次以持久化。")
+                } else {
+                    extension_guidance(browser, &exe, &destination)
+                }
+            }
+        }
+    };
+    // 安装动作可能改变 profile 记录，清空扫描缓存让 UI 立即翻转状态。
+    if let Ok(mut cache) = state.extension_status.lock() {
+        *cache = None;
+    }
+    Ok(message)
+}
+
+/// 双浏览器扩展安装状态（强制全量扫描，绕过缓存）。
+#[tauri::command]
+fn chrome_extension_status(state: State<'_, AppState>) -> Result<ChromeExtensionView, String> {
+    Ok(scan_extension_statuses(&state))
 }
 
 #[tauri::command]
@@ -2890,6 +3259,7 @@ fn snapshot(state: &AppState) -> Result<AppSnapshot, String> {
         } else {
             browser.message.clone()
         },
+        chrome_extension: cached_extension_status(state),
     })
 }
 
@@ -3437,6 +3807,7 @@ pub fn run() {
                 dsh: Mutex::new(ManagedChild::stopped("等待启动")),
                 mca: Mutex::new(ManagedChild::stopped("等待启动")),
                 browser: Mutex::new(ManagedChild::stopped("等待启动")),
+                extension_status: Mutex::new(None),
                 runtime,
             });
 
@@ -3547,6 +3918,7 @@ pub fn run() {
             open_dsh,
             open_dsh_window_command,
             install_chrome_extension,
+            chrome_extension_status,
             check_for_update,
             apply_updates,
             open_dsh_guide,
@@ -3619,6 +3991,118 @@ mod tests {
         haystack
             .windows(needle.len())
             .position(|window| window == needle)
+    }
+
+    /// 构造一个 profile 的 Secure Preferences：extensions.settings 下
+    /// 写入 chromeUse 扩展记录。
+    fn write_extension_record(profile_dir: &Path, record: serde_json::Value) {
+        let prefs = json!({
+            "extensions": { "settings": { EXTENSION_ID: record } }
+        });
+        write(
+            &profile_dir.join("Secure Preferences"),
+            &prefs.to_string(),
+        );
+    }
+
+    /// 扩展四态判定：无记录 / 健康记录 / path 指向消失目录（残影）/
+    /// state:0（禁用）。
+    #[test]
+    fn extension_status_classifies_four_states() {
+        let tmp = TempDir::new("ext-status");
+        let user_data = tmp.path().join("User Data");
+        let default = user_data.join("Default");
+        fs::create_dir_all(&default).unwrap();
+        // 当前数据根扩展（期望 manifest：version + key）
+        let ext = tmp.path().join("browser-extension");
+        write(&ext.join("manifest.json"), r#"{"version":"0.1.0","key":"KEY"}"#);
+        let expected: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(ext.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+
+        // 未安装：profile 里没有记录
+        write(&default.join("Secure Preferences"), r#"{"extensions":{"settings":{}}}"#);
+        let (status, profile, path) = scan_browser_extension(&user_data, Some(&expected));
+        assert_eq!(status, ExtensionInstallState::NotInstalled);
+        assert!(profile.is_none() && path.is_none());
+
+        // 已安装：记录 path 指向真实目录且 manifest 一致
+        write_extension_record(
+            &default,
+            json!({ "state": 1, "path": path_string(&ext) }),
+        );
+        let (status, profile, path) = scan_browser_extension(&user_data, Some(&expected));
+        assert_eq!(status, ExtensionInstallState::Installed);
+        assert_eq!(profile.as_deref(), Some("Default"));
+        assert_eq!(path.as_deref(), Some(path_string(&ext).as_str()));
+
+        // 失效：path 指向已消失的目录（旧版本残留）
+        write_extension_record(
+            &default,
+            json!({ "state": 1, "path": path_string(&tmp.path().join("gone")) }),
+        );
+        let (status, _, _) = scan_browser_extension(&user_data, Some(&expected));
+        assert_eq!(status, ExtensionInstallState::Stale);
+
+        // 禁用：state:0
+        write_extension_record(
+            &default,
+            json!({ "state": 0, "path": path_string(&ext) }),
+        );
+        let (status, _, _) = scan_browser_extension(&user_data, Some(&expected));
+        assert_eq!(status, ExtensionInstallState::Disabled);
+    }
+
+    /// 路径校验：记录目录存在但 manifest version 与当前数据根不一致 ->
+    /// 失效（提示一键修复）。
+    #[test]
+    fn extension_status_marks_version_mismatch_stale() {
+        let tmp = TempDir::new("ext-version");
+        let user_data = tmp.path().join("User Data");
+        let default = user_data.join("Default");
+        fs::create_dir_all(&default).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(r#"{"version":"0.2.0","key":"KEY"}"#).unwrap();
+        // 旧版本扩展目录：manifest 存在但 version 不同
+        let old = tmp.path().join("old-extension");
+        write(&old.join("manifest.json"), r#"{"version":"0.1.0","key":"KEY"}"#);
+        write_extension_record(&default, json!({ "state": 1, "path": path_string(&old) }));
+
+        let (status, _, _) = scan_browser_extension(&user_data, Some(&expected));
+        assert_eq!(status, ExtensionInstallState::Stale, "版本不一致应判失效");
+    }
+
+    /// 多 profile 归并：Default 是残影记录、Profile 1 健康 ->
+    /// 浏览器级状态取健康记录（installed > disabled > stale）。
+    #[test]
+    fn extension_scan_merges_profiles_preferring_healthy_record() {
+        let tmp = TempDir::new("ext-merge");
+        let user_data = tmp.path().join("User Data");
+        let default = user_data.join("Default");
+        let profile1 = user_data.join("Profile 1");
+        fs::create_dir_all(&default).unwrap();
+        fs::create_dir_all(&profile1).unwrap();
+        let ext = tmp.path().join("browser-extension");
+        write(&ext.join("manifest.json"), r#"{"version":"0.1.0","key":"KEY"}"#);
+        let expected: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(ext.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        // Default：残影（path 已消失）
+        write_extension_record(
+            &default,
+            json!({ "state": 1, "path": path_string(&tmp.path().join("gone")) }),
+        );
+        // Profile 1：健康
+        write_extension_record(
+            &profile1,
+            json!({ "state": 1, "path": path_string(&ext) }),
+        );
+
+        let (status, profile, _) = scan_browser_extension(&user_data, Some(&expected));
+        assert_eq!(status, ExtensionInstallState::Installed);
+        assert_eq!(profile.as_deref(), Some("Profile 1"), "应取健康记录所在 profile");
     }
 
     /// agent shim 内容：包含默认 profile 注入与 mcp 子命令仿真，

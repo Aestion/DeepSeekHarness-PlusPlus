@@ -25,7 +25,7 @@ node lib/index.js --host 127.0.0.1 --port 18766 --data <数据根>
 ```
 
 - MCP 端点：`POST http://127.0.0.1:18766/mcp`
-- 健康检查：`GET http://127.0.0.1:18766/api/health`
+- 健康检查：`GET http://127.0.0.1:18766/api/health`（含 `shared.connected`：共享桥是否在线）
 - 扩展桥：`GET /ext/poll`、`POST /ext/response`
 
 ## 工具

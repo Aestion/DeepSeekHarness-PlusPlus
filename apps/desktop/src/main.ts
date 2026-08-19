@@ -59,6 +59,17 @@ interface McaProviderView {
   detail: string
 }
 
+type ExtensionInstallState = 'not-installed' | 'installed' | 'stale' | 'disabled'
+
+/** chromeUse 扩展在单个浏览器中的安装四态 + 桥连接状态。 */
+interface BrowserExtensionStatus {
+  browser: string
+  status: ExtensionInstallState
+  profile: string | null
+  path: string | null
+  connected: boolean
+}
+
 interface AppSnapshot {
   version: string
   config: AppConfig
@@ -73,6 +84,7 @@ interface AppSnapshot {
   mcaProviders: McaProviderView[]
   browserState: ServiceState
   browserMessage: string
+  chromeExtension: { chrome: BrowserExtensionStatus; edge: BrowserExtensionStatus }
 }
 
 const app = document.querySelector<HTMLDivElement>('#app')!
@@ -225,9 +237,9 @@ app.innerHTML = `
               <span class="switch compact"><input type="checkbox" id="enable-chrome-use"><span></span></span>
             </label>
           </div>
+          <div class="extension-rows" id="browser-extension-rows"></div>
           <div class="card-actions">
-            <button class="button outline" id="install-extension">安装 Chrome 扩展</button>
-            <span class="capability-note" id="browser-hint">启用后需重启 DSH 使工具进入对话；网关本身实时启停。</span>
+            <span class="capability-note" id="browser-hint">启用“Chrome 共享标签”后，按下方状态行一键安装；网关本身实时启停。</span>
           </div>
         </article>
 
@@ -406,6 +418,64 @@ function stateLabel(state: ServiceState): string {
   return ({ stopped: '已停止', starting: '启动中', running: '运行中', error: '异常' })[state]
 }
 
+/** 扩展安装四态文案。 */
+const EXTENSION_STATE_LABELS: Record<ExtensionInstallState, string> = {
+  'not-installed': '未安装',
+  installed: '已安装',
+  stale: '已安装但失效',
+  disabled: '已安装但禁用',
+}
+
+/**
+ * Chrome/Edge 扩展状态行：每浏览器一行，按状态分派按钮文案
+ * （未安装 -> 一键安装；失效 -> 一键修复；禁用 -> 重新启用；
+ * 已装未连 -> 打开浏览器连接；已连接 -> 绿色徽标）。
+ */
+function renderExtensionRows(): void {
+  const box = byId('browser-extension-rows')
+  const extension = snapshot?.chromeExtension
+  if (snapshot === null || !snapshot.config.enableChromeUse || extension === undefined) {
+    box.innerHTML = ''
+    return
+  }
+  const rows = (['chrome', 'edge'] as const).map(key => {
+    const status = extension[key]
+    const browserLabel = key === 'edge' ? 'Edge' : 'Chrome'
+    const stateLabel = EXTENSION_STATE_LABELS[status.status]
+    const profile = status.profile === null ? '' : ` · ${status.profile}`
+    if (status.status === 'installed' && status.connected) {
+      return `<div class="extension-row">
+        <strong>${browserLabel}</strong>
+        <span class="ext-badge ok">已连接</span>
+        <small>${stateLabel}${profile}</small>
+      </div>`
+    }
+    const action = status.status === 'not-installed'
+      ? '一键安装'
+      : status.status === 'stale'
+        ? '一键修复'
+        : status.status === 'disabled'
+          ? '重新启用'
+          : '打开浏览器连接'
+    return `<div class="extension-row">
+      <strong>${browserLabel}</strong>
+      <span class="ext-badge">${stateLabel}</span>
+      <small>${status.connected ? '桥在线' : ''}${profile}</small>
+      <button class="button outline" data-install-extension="${key}">${action}</button>
+    </div>`
+  })
+  box.innerHTML = rows.join('')
+  box.querySelectorAll<HTMLButtonElement>('[data-install-extension]').forEach(button => {
+    button.addEventListener('click', () => perform(async () => {
+      const hint = await invoke<string>('install_chrome_extension', { browser: button.dataset.installExtension })
+      byId('browser-hint').textContent = hint
+      toast(hint)
+      // 安装动作可能改变 profile 记录（缓存已在后端清空），拉全量快照翻转状态行。
+      await refresh(true)
+    }))
+  })
+}
+
 function renderStatus(data: AppSnapshot): void {
   for (const service of ['dsh', 'mca', 'browser'] as const) {
     const state = data[`${service}State`]
@@ -444,6 +514,7 @@ function renderStatus(data: AppSnapshot): void {
   byId<HTMLButtonElement>('configure-dsh').disabled = data.dshState !== 'running'
   byId('portable-mode').textContent = data.runtime.portable ? '捆绑运行时已就绪' : '开发运行时'
   byId('dsh-home').textContent = data.runtime.dshHome ?? '—'
+  renderExtensionRows()
 }
 
 function renderAll(data: AppSnapshot): void {
@@ -562,11 +633,6 @@ byId('open').addEventListener('click', () => perform(async () => { await invoke(
 byId('open-browser').addEventListener('click', () => perform(async () => { await invoke('open_dsh'); toast('已在系统浏览器中打开 DSH。') }))
 byId('configure-dsh').addEventListener('click', () => perform(async () => { await invoke('open_dsh_window_command'); toast('请在 DSH 的“设置 → 模型”中配置主模型。') }))
 byId('refresh').addEventListener('click', () => refresh(false))
-byId('install-extension').addEventListener('click', () => perform(async () => {
-  const hint = await invoke<string>('install_chrome_extension')
-  byId('browser-hint').textContent = hint
-  toast('扩展资源已准备，按 Chrome 页面提示完成首次加载。')
-}))
 byId('enable-computer-provider').addEventListener('click', () => perform(async () => {
   const data = await invoke<AppSnapshot>('enable_computer_provider')
   renderAll(data)

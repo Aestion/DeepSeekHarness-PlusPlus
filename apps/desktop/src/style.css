@@ -122,6 +122,13 @@ button:disabled { cursor: default; opacity: .42; }
 .switch.compact input:checked + span::after { transform: translateX(14px); }
 .capabilities-disabled .capability-item { opacity: .5; background: var(--bg-subtle); cursor: default; }
 .capability-note { margin: 13px 2px 0; color: var(--tertiary); font-size: 9px; line-height: 15px; }
+.extension-rows { display: grid; gap: 7px; margin-top: 13px; }
+.extension-row { display: flex; align-items: center; gap: 10px; padding: 8px 11px; border: 1px solid var(--line-1); border-radius: 10px; font-size: 11px; }
+.extension-row strong { color: var(--text); font-size: 11px; }
+.extension-row small { flex: 1; overflow: hidden; color: var(--tertiary); font-size: 9px; white-space: nowrap; text-overflow: ellipsis; }
+.extension-row .button { min-height: 26px; padding: 0 10px; border-radius: 8px; font-size: 10px; }
+.ext-badge { padding: 1px 8px; border-radius: 8px; color: #8a6117; background: #fdf5e4; font-size: 9px; font-weight: 600; white-space: nowrap; }
+.ext-badge.ok { color: #3a7a4f; background: #e8f5ec; }
 .card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 22px; padding-bottom: 17px; border-bottom: 1px solid var(--line-1); }
 .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; padding-top: 18px; }
 label { color: var(--secondary); font-size: 11px; font-weight: 500; }

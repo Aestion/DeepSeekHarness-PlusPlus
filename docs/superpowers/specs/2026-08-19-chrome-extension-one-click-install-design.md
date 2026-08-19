@@ -79,6 +79,56 @@
 - **网关测试**：`/api/health` 含 `connected` 字段。
 - **本机实测**：Chrome 检测出"已安装但失效"，一键修复后翻转健康；Edge 装好后桥连接。
 
+## 实现细化（执行前补充，2026-08-19）
+
+### A. 检测核心为纯函数（可单测）
+
+- `classify_extension_record(record, expected_manifest)`：单条 profile 记录 -> 四态。
+  判定顺序：**禁用优先**（`state == 0` 或 `disable_reasons` 非空 -> `disabled`），其次路径校验（`path` 目录缺失 / 无 `manifest.json` / `version`/`key` 与期望 manifest 不一致 -> `stale`），否则 `installed`。
+- `scan_browser_extension(user_data_dir, expected_manifest)`：扫描 `Default` 与 `Profile N` 的 `Preferences` / `Secure Preferences`，**多 profile 归并优先级：installed > disabled > stale**（任一 profile 健康即报健康，避免残影 profile 压过健康记录）。
+- 期望 manifest 来源：数据根 `browser-extension/manifest.json`，缺失时回退 `extension_source()`（runtime/browser/extension）。
+- user-data 目录：`%LOCALAPPDATA%\{Google\Chrome, Microsoft\Edge}\User Data`。
+
+### B. snapshot 集成与缓存
+
+- `AppSnapshot` 增加 `chromeExtension: { chrome, edge }`，每个为 `{ browser, status, profile, path, connected }`。
+- UI 每 1.5s 轮询 snapshot，而 `Secure Preferences` 可达数 MB -> **扫描结果缓存 3 秒**（AppState 内存缓存），避免反复解析。
+- `connected` 来自网关 `GET /api/health` 的 `shared.connected`（网关端口未开时直接 `false`，不发请求）；两端浏览器共用同一桥连接位。
+
+### C. 一键安装分派决策表
+
+`install_chrome_extension(browser: "chrome" | "edge")`（缺省 `chrome`）：
+
+| 检测状态 | 浏览器进程 | 动作 |
+|---|---|---|
+| `installed` | 未运行 | 拉起浏览器（无参数），轮询桥连接 8s（500ms 间隔） |
+| `installed` | 运行中 | 直接轮询桥连接 8s（扩展 SW 会自动重连） |
+| 其余三态 | 未运行 | 先确保网关运行；以 `--load-extension=<数据根>` 拉起浏览器；轮询桥连接 8s，**连上即成功**（旧版浏览器全自动化路径）；未连上（Chrome/Edge 137+ 拦截命令行加载）回退引导 |
+| 其余三态 | 运行中 | 直接回退引导（命令行参数对已运行实例无效） |
+
+回退引导 = 用浏览器 exe 打开 `chrome://extensions` / `edge://extensions` + 扩展目录复制到剪贴板 + 文案指引（一次“加载已解压”后永久持久化）。
+
+- 浏览器 exe 发现：`Program Files` / `Program Files (x86)` / `LOCALAPPDATA` 下的 `Google\Chrome\Application\chrome.exe` 与 `Microsoft\Edge\Application\msedge.exe`。
+- 进程检测：`tasklist /FI "IMAGENAME eq chrome.exe|msedge.exe"`。
+- 安装动作结束清空扫描缓存，UI 下一次轮询即翻转状态。
+
+### D. Edge native host
+
+- `prepare_chrome_extension` 同时写两条注册表（同一份 host-manifest.json / launcher）：
+  `HKCU\Software\Google\Chrome\NativeMessagingHosts\com.dshplusplus.browser` 与
+  `HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.dshplusplus.browser`。
+- `unregister_chrome_native_host`（含 AppState::drop）双键注销。
+- manifest 的 `key` 使扩展 ID 在 Chrome/Edge 一致（`kikoigbglcakhdeknllbinnaepdaoofh`），`allowed_origins` 无需分浏览器。
+
+### E. 测试清单
+
+- Rust 单测（fixture profile JSON + 临时目录）：
+  1. 四态判定（无记录 / 健康记录 / path 缺失 / state:0）；
+  2. manifest version 不一致 -> `stale`；
+  3. 多 profile 归并（Default 残影 + Profile 1 健康 -> `installed`）。
+- 网关 vitest：`/api/health` 返回 `shared: { connected: false }`（未连接时）。
+- 本机实测：Chrome 检测出 `stale`（dev.1 残影）-> 一键修复翻转；Edge `not-installed` -> 引导加载后桥连接。
+
 ## 非目标（YAGNI）
 
 - 不做 Chrome Web Store 上架 + 企业策略（ExtensionInstallForcelist）静默安装（需商店审核，另行立项）。

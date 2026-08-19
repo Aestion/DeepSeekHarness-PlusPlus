@@ -219,7 +219,13 @@ export class BrowserMcpServer {
     try {
       if (request.method === 'GET' && path === '/api/health') {
         response.writeHead(200, { 'Content-Type': 'application/json' })
-        response.end(JSON.stringify({ status: 'ok', contract: 'dshplusplus.browser-gateway.v1' }))
+        response.end(
+          JSON.stringify({
+            status: 'ok',
+            contract: 'dshplusplus.browser-gateway.v1',
+            shared: { connected: this.shared.connected },
+          }),
+        )
         return
       }
       if (request.method === 'GET' && path === '/ext/poll') {
