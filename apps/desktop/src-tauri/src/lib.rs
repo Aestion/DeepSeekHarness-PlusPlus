@@ -415,9 +415,39 @@ const DSH_CLI_RELATIVE_PATHS: &[&str] = &[
     "dsh.exe",
 ];
 
+/// CLI 文件是否能在本平台被直接启动。
+///
+/// Windows 上 npm 全局安装会在 bin 目录同时生成无扩展名的 sh shim
+/// （`dsh`，供 Git Bash 使用）与 `dsh.ps1`；二者都无法被 CreateProcess
+/// 直接执行（报 os error 193），必须排除，只接受 node 脚本、cmd/bat
+/// shim 与原生 exe。
+fn is_executable_cli_file(path: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        path.extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("js")
+                || ext.eq_ignore_ascii_case("mjs")
+                || ext.eq_ignore_ascii_case("cjs")
+                || ext.eq_ignore_ascii_case("cmd")
+                || ext.eq_ignore_ascii_case("bat")
+                || ext.eq_ignore_ascii_case("exe")
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        match path.extension() {
+            Some(ext) => !ext.eq_ignore_ascii_case("ps1"),
+            None => true,
+        }
+    }
+}
+
 /// Accept a CLI file or a directory at any common DSH install/source level.
 fn resolve_dsh_cli_candidate(input: &Path) -> Option<PathBuf> {
     if input.is_file() {
+        if !is_executable_cli_file(input) {
+            return None;
+        }
         return Some(input.to_path_buf());
     }
     if !input.is_dir() {
@@ -584,7 +614,11 @@ fn discover_runtime() -> Result<RuntimePaths, String> {
     })
 }
 
-/// 在 PATH 中查找 `dsh`（dsh.exe / dsh.cmd / dsh）。
+/// 在 PATH 中查找 `dsh`（dsh.exe / dsh.cmd / bin.js）。
+///
+/// `where dsh` 会按目录顺序列出所有命中项；npm 全局安装时排在最前的
+/// 是无扩展名的 sh shim（Git Bash 用），无法在 Windows 直接执行，须
+/// 逐行筛选，取第一个可执行的 CLI 形态。
 fn find_dsh_on_path() -> Option<PathBuf> {
     let output = std::process::Command::new("where")
         .arg("dsh")
@@ -596,8 +630,8 @@ fn find_dsh_on_path() -> Option<PathBuf> {
     let text = String::from_utf8_lossy(&output.stdout);
     text.lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .and_then(|line| resolve_dsh_cli_candidate(Path::new(line)))
+        .filter(|line| !line.is_empty())
+        .find_map(|line| resolve_dsh_cli_candidate(Path::new(line)))
 }
 
 /// 查找 npm/pnpm 全局安装的 dsh；不依赖 GUI 进程继承到最新 PATH。
@@ -4525,6 +4559,59 @@ llm-deepseek:
         assert_eq!(
             payload["enabled"], serde_json::Value::Bool(true),
             "请求体应为 enabled=true"
+        );
+    }
+
+    /// 构造一个 npm 全局 bin 目录的常见布局：无扩展名 sh shim、dsh.cmd、
+    /// dsh.ps1 并存，包本体在 node_modules 下。
+    fn write_npm_bin_layout(dir: &Path) {
+        write(&dir.join("dsh"), "#!/bin/sh\nnode \"$0\" \n");
+        write(&dir.join("dsh.cmd"), "@echo off\r\nnode \"%~dp0\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js\" %*\r\n");
+        write(&dir.join("dsh.ps1"), "node \"$PSScriptRoot\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js\" $args\r\n");
+        write(
+            &dir.join("node_modules/@deepseek-ai/dsh/lib/bin.js"),
+            "#!/usr/bin/env node\n",
+        );
+    }
+
+    /// Windows 上无扩展名的 npm sh shim 与 .ps1 无法被 CreateProcess 执行，
+    /// 不能作为 CLI 候选（os error 193 的根因）。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn resolve_dsh_cli_candidate_rejects_windows_unlaunchable_files() {
+        let tmp = TempDir::new("cli-reject");
+        write_npm_bin_layout(tmp.path());
+        assert!(
+            resolve_dsh_cli_candidate(&tmp.path().join("dsh")).is_none(),
+            "无扩展名 sh shim 应被拒绝"
+        );
+        assert!(
+            resolve_dsh_cli_candidate(&tmp.path().join("dsh.ps1")).is_none(),
+            "dsh.ps1 应被拒绝"
+        );
+        assert!(
+            resolve_dsh_cli_candidate(&tmp.path().join("dsh.cmd")).is_some(),
+            "dsh.cmd 应被接受"
+        );
+        assert!(
+            resolve_dsh_cli_candidate(&tmp.path().join("node_modules/@deepseek-ai/dsh/lib/bin.js"))
+                .is_some(),
+            "bin.js 应被接受"
+        );
+    }
+
+    /// 传入 npm 全局 bin 目录时应越过同目录的 sh shim / .ps1，解析到包本
+    /// 体的 bin.js。
+    #[test]
+    fn resolve_dsh_cli_candidate_prefers_package_bin_in_npm_dir() {
+        let tmp = TempDir::new("cli-npm-dir");
+        write_npm_bin_layout(tmp.path());
+        let cli = resolve_dsh_cli_candidate(tmp.path()).expect("npm 目录应能解析出 CLI");
+        assert!(
+            cli.ends_with("node_modules/@deepseek-ai/dsh/lib/bin.js")
+                || cli.ends_with("node_modules\\@deepseek-ai\\dsh\\lib\\bin.js"),
+            "应解析到包本体 bin.js，实际：{}",
+            cli.display()
         );
     }
 }
