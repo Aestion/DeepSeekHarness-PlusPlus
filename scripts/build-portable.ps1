@@ -105,7 +105,10 @@ foreach ($tarball in $packTarballs) {
     if (-not (Test-Path -LiteralPath $tarball -PathType Leaf)) { throw "缺少插件包: $tarball（先运行 pnpm pack:plugins）" }
     $target = Join-Path $tmpExtract ([System.IO.Path]::GetFileNameWithoutExtension($tarball))
     New-Item -ItemType Directory -Force -Path $target | Out-Null
-    tar -xzf $tarball -C $target
+    # Windows tar（bsdtar）把 `E:\...` 的盘符冒号当成远端主机（"Cannot connect to E"），
+    # 改成工作区相对路径即可避免：脚本顶部已 Set-Location $workspace。
+    $relTarball = $tarball.Substring($workspace.Length).TrimStart('\')
+    tar -xzf $relTarball -C $target
     if ($LASTEXITCODE -ne 0) { throw "解压插件包失败: $tarball" }
     $pkgDir = Join-Path $target 'package'
     if (-not (Test-Path -LiteralPath (Join-Path $pkgDir 'package.json') -PathType Leaf)) { throw "插件包结构异常: $tarball" }
