@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "dshplusplusVersion": "0.1.0-dev.2",
+  "dshplusplusVersion": "0.1.0-dev.8",
   "milestone": "M0",
   "node": "^22.19.0 || >=24.0.0",
   "pnpm": "11.7.0",

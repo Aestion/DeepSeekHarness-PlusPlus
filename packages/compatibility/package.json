@@ -1,6 +1,6 @@
 {
   "name": "@dshplusplus/compatibility",
-  "version": "0.1.0-dev.2",
+  "version": "0.1.0-dev.8",
   "description": "DSH++ runtime manifest reader and compatibility doctor",
   "type": "module",
   "main": "lib/index.js",
@@ -17,6 +17,7 @@
   "files": [
     "lib/**/*.js",
     "lib/**/*.d.ts",
+    "data/**/*.json",
     "README.md"
   ],
   "license": "MIT",
