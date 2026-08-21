@@ -171,5 +171,6 @@ class LlmMultimodalProvider implements MultimodalProvider {
 export function apply(ctx: Context, config: Config): void {
   const resolved = config as ResolvedConfig
   assertConfig(resolved)
-  ctx.multimodal.registerProvider(new LlmMultimodalProvider(ctx, resolved))
+  // 把注册绑定到本插件 ctx：插件被 dispose 时 provider 随之下线，避免重载后残留。
+  ctx.multimodal.registerProvider(new LlmMultimodalProvider(ctx, resolved), ctx)
 }

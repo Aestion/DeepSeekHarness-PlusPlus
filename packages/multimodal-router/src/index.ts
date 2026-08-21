@@ -128,6 +128,12 @@ const VISION_EXTERNAL_TOOL = 'dshplusplus:vision-external'
 /** 未获授权时的模型可见占位文本。 */
 const VISION_UNAUTHORIZED_TEXT = '[图片未外发：未获授权将图片发送给视觉模型进行分析。]'
 
+// 并发去重：同一步骤的多条消息会并行处理，若都携带图片，会在任一 `approval/decided`
+// 事件写入前同时通过 granted 检查，导致重复弹窗。用"会话 × 动作"级的 in-flight
+// promise 串行化，同一会话同一动作并发请求只问一次。按会话隔离，避免 A 会话的
+// 授权被 B 会话复用。
+const inFlightApproval = new WeakMap<object, Map<string, Promise<void>>>()
+
 /** 会话事件流中的 `approval/asked`（id → toolName）。 */
 type AskedEvent = { id: string; toolName: string }
 type DecidedEvent = { id: string; outcome: string }
@@ -184,17 +190,35 @@ async function ensureVisionApproval(
   if (approval === undefined) return
   if (approval.effectivePolicy(agent.session) === 'never') return
   if (visionApprovalGranted(agent.session.events, VISION_EXTERNAL_TOOL)) return
-  const outcome = await approval.request({
-    agent,
-    toolName: VISION_EXTERNAL_TOOL,
-    reason: '将图片内容发送给视觉模型生成观察描述（图片会发送到视觉模型服务进行分析）',
-    signal,
-  })
-  if (outcome !== 'allowed-once') {
-    const error = new Error(`图片外发未获授权（${outcome}）`)
-    ;(error as { code?: string }).code = `VISION_EXTERNAL_${outcome.toUpperCase()}`
-    throw error
+  // 同会话同动作并发请求只问一次：先到者建 promise，迟到者复用。
+  const session = agent.session as object
+  let byTool = inFlightApproval.get(session)
+  if (byTool === undefined) {
+    byTool = new Map()
+    inFlightApproval.set(session, byTool)
   }
+  const existing = byTool.get(VISION_EXTERNAL_TOOL)
+  if (existing !== undefined) return existing
+  const request: Promise<void> = (async () => {
+    const outcome = await approval.request({
+      agent,
+      toolName: VISION_EXTERNAL_TOOL,
+      reason: '将图片内容发送给视觉模型生成观察描述（图片会发送到视觉模型服务进行分析）',
+      signal,
+    })
+    if (outcome !== 'allowed-once') {
+      const error = new Error(`图片外发未获授权（${outcome}）`)
+      ;(error as { code?: string }).code = `VISION_EXTERNAL_${outcome.toUpperCase()}`
+      throw error
+    }
+  })()
+  byTool.set(VISION_EXTERNAL_TOOL, request)
+  // 无论成功/拒绝都要清掉 in-flight，使后续独立动作能重新询问。
+  const clear = () => {
+    byTool?.delete(VISION_EXTERNAL_TOOL)
+  }
+  void request.then(clear, clear)
+  return request
 }
 
 async function rewriteBlocks(

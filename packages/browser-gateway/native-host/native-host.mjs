@@ -5,14 +5,33 @@
 //
 // Frame format (Native Messaging): 4-byte little-endian length + UTF-8 JSON.
 
-import { resolve } from 'node:path'
-import { appendFileSync } from 'node:fs'
+import { resolve, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { appendFileSync, readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 
 // The gateway base URL is injected by the launcher (native hosts are spawned
 // by Chrome and do not inherit the desktop app's environment). Defaults keep
 // manual runs working.
 const GATEWAY = process.env.DSHPLUSPLUS_GATEWAY ?? 'http://127.0.0.1:18766'
+
+// 与网关共享的 token：读取与 native-host.mjs 同目录的 gateway.token（由网关在
+// 启动时生成，与扩展同目录）。首装时网关可能尚未落盘，故每轮轮询前重读，得到 401
+// 时再刷一次重试，避免"网关晚写 token → host 已死"的竞态。
+const HOST_DIR = dirname(fileURLToPath(import.meta.url))
+let TOKEN = ''
+function refreshToken() {
+  try {
+    const next = readFileSync(resolve(HOST_DIR, 'gateway.token'), 'utf8').trim()
+    if (next && next !== TOKEN) {
+      TOKEN = next
+      trace('token-refreshed')
+    }
+  } catch {
+    // token 文件尚未生成：保留当前值，下一轮再试。
+  }
+}
+refreshToken()
 
 // Debug tracing: DSHPLUSPLUS_HOST_DEBUG_FILE=<path> writes a JSONL trace of
 // every frame and poll round-trip, otherwise invisible because Chrome owns
@@ -97,11 +116,21 @@ async function pollLoop() {
   for (;;) {
     let timeout
     try {
+      // 每轮先刷新 token：首装时网关可能刚落盘，迟到的 host 仍能接上。
+      refreshToken()
       const controller = new AbortController()
       timeout = setTimeout(() => controller.abort(), 28_000)
-      const response = await fetch(`${GATEWAY}/ext/poll`, { signal: controller.signal })
+      const headers = TOKEN ? { 'x-dshplusplus-token': TOKEN } : undefined
+      const response = await fetch(`${GATEWAY}/ext/poll`, { signal: controller.signal, headers })
       clearTimeout(timeout)
       timeout = undefined
+      // 401 = 网关已起但未认我们的 token（多半是 token 刚写入）。刷新后立即重试，
+      // 不计入"网关离线"的退出计数。
+      if (response.status === 401) {
+        trace('poll-unauthorized', { tokenLen: TOKEN.length })
+        refreshToken()
+        continue
+      }
       if (!response.ok) throw new Error(`poll HTTP ${response.status}`)
       consecutiveGatewayFailures = 0
       const body = await response.json()
@@ -122,11 +151,20 @@ async function pollLoop() {
           }
         }, 20_000)
       })
-      const replyResponse = await fetch(`${GATEWAY}/ext/response`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(reply),
-      })
+      // POST 回包带超时：网关即使 413/异常，也要让轮询循环继续，不能卡死。
+      const replyController = new AbortController()
+      const replyTimeout = setTimeout(() => replyController.abort(), 10_000)
+      let replyResponse
+      try {
+        replyResponse = await fetch(`${GATEWAY}/ext/response`, {
+          method: 'POST',
+          signal: replyController.signal,
+          headers: { 'Content-Type': 'application/json', ...(TOKEN ? { 'x-dshplusplus-token': TOKEN } : {}) },
+          body: JSON.stringify(reply),
+        })
+      } finally {
+        clearTimeout(replyTimeout)
+      }
       trace('response-posted', { id: request.id, status: replyResponse.status })
       if (!replyResponse.ok) console.error('[native-host] response post failed', replyResponse.status)
     } catch (error) {

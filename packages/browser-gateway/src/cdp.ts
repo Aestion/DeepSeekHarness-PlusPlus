@@ -20,6 +20,7 @@ export class CdpSession {
   private readonly socket: WebSocket
   private nextId = 1
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>()
+  private readonly listeners = new Map<string, Set<(params: unknown) => void>>()
   private closed = false
 
   private constructor(socket: WebSocket) {
@@ -42,6 +43,14 @@ export class CdpSession {
           entry.reject(new Error(`CDP ${response.error.code}: ${response.error.message}`))
         } else {
           entry.resolve(response.result)
+        }
+        return
+      }
+      // Notifications (no id) are dispatched to on() subscribers, e.g. Page.loadEventFired.
+      if (typeof message.method === 'string') {
+        const set = this.listeners.get(message.method)
+        if (set !== undefined) {
+          for (const listener of set) listener(message.params)
         }
       }
     })
@@ -85,11 +94,42 @@ export class CdpSession {
     }
   }
 
-  send(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+  /** Subscribe to an event notification (e.g. Page.loadEventFired). Returns an unsubscribe fn. */
+  on(method: string, listener: (params: unknown) => void): () => void {
+    let set = this.listeners.get(method)
+    if (set === undefined) {
+      set = new Set()
+      this.listeners.set(method, set)
+    }
+    set.add(listener)
+    return () => {
+      set.delete(listener)
+    }
+  }
+
+  /**
+   * Send a CDP command. A per-call timeout guards against a page that never
+   * answers (hung async IIFE, blocking dialog) — otherwise the MCP request
+   * waits forever and leaks the session.
+   */
+  send(method: string, params: Record<string, unknown> = {}, timeoutMs = 30_000): Promise<unknown> {
     if (this.closed) return Promise.reject(new Error('CDP session closed'))
     const id = this.nextId++
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      const timer = setTimeout(() => {
+        this.pending.delete(id)
+        reject(new Error(`CDP ${method} timed out after ${timeoutMs}ms`))
+      }, timeoutMs)
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer)
+          resolve(value)
+        },
+        reject: (error) => {
+          clearTimeout(timer)
+          reject(error)
+        },
+      })
       this.socket.send(JSON.stringify({ id, method, params }))
     })
   }
@@ -117,10 +157,24 @@ export async function createTarget(port: number): Promise<CdpTarget> {
   return target
 }
 
-/** Navigate an attached page session to a URL. */
+/** Navigate an attached page session to a URL, awaiting the load event. */
 export async function navigate(session: CdpSession, url: string): Promise<void> {
   await session.send('Page.enable')
-  await session.send('Page.navigate', { url })
+  const loaded = new Promise<void>((resolve) => {
+    const off = session.on('Page.loadEventFired', () => {
+      off()
+      resolve()
+    })
+  })
+  const result = (await session.send('Page.navigate', { url })) as { errorText?: string }
+  if (result.errorText !== undefined) {
+    throw new Error(`navigate failed: ${result.errorText}`)
+  }
+  // 超时兜底：有些页面（如被拦截的导航）永远不触发 loadEventFired。
+  const timeout = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error('页面加载超时')), 30_000)
+  })
+  await Promise.race([loaded, timeout])
 }
 
 /** Navigate back/forward in the page session history. delta=-1 back, +1 forward. */
@@ -179,6 +233,9 @@ export async function pressKey(session: CdpSession, key: string): Promise<void> 
     PageDown: { code: 'PageDown', windowsVirtualKeyCode: 34 },
   }
   const keyInfo = mapping[key] ?? { code: key }
-  await session.send('Input.dispatchKeyEvent', { type: 'keyDown', ...keyInfo })
-  await session.send('Input.dispatchKeyEvent', { type: 'keyUp', ...keyInfo })
+  // Enter 需要 text:'\r' 才会触发表单提交/按钮激活；单字符键补 text 触发默认行为。
+  const text = key === 'Enter' ? '\r' : (key.length === 1 ? key : undefined)
+  const event = { ...keyInfo, ...(text !== undefined ? { text, unmodifiedText: text } : {}) }
+  await session.send('Input.dispatchKeyEvent', { type: 'keyDown', ...event })
+  await session.send('Input.dispatchKeyEvent', { type: 'keyUp', ...event })
 }

@@ -9,7 +9,7 @@ function valueAfter(args: readonly string[], option: string): string | undefined
 }
 
 const args = process.argv.slice(2)
-const manifestPath = fileURLToPath(new URL('../../../runtime/manifests/compatibility.json', import.meta.url))
+const manifestPath = fileURLToPath(new URL('../data/compatibility.json', import.meta.url))
 const report = runDoctor(loadManifest(manifestPath), valueAfter(args, '--dsh-root'))
 
 if (args.includes('--json')) {

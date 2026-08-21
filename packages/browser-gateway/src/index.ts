@@ -15,28 +15,10 @@
  * tool call and is terminated when the gateway exits.
  */
 
+import { parseArgs } from './cli.js'
 import { ManagedChrome } from './chrome.js'
-import { BrowserMcpServer, BROWSER_PORT } from './mcp.js'
+import { BrowserMcpServer } from './mcp.js'
 import { SharedTabBridge } from './shared.js'
-
-interface CliOptions {
-  host: string
-  port: number
-  dataRoot: string
-}
-
-function parseArgs(argv: readonly string[]): CliOptions {
-  const options: CliOptions = { host: '127.0.0.1', port: BROWSER_PORT, dataRoot: process.cwd() }
-  for (let index = 0; index < argv.length; index += 1) {
-    const flag = argv[index]
-    const value = argv[index + 1]
-    if (value === undefined) continue
-    if (flag === '--host') options.host = value
-    if (flag === '--port') options.port = Number.parseInt(value, 10)
-    if (flag === '--data') options.dataRoot = value
-  }
-  return options
-}
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2))

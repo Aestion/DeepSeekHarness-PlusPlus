@@ -60,16 +60,26 @@ export class MultimodalRuntime extends Service {
 
   /**
    * Register one provider until the owning Cordis fiber is disposed.
+   *
+   * The registration is bound to the CALLING plugin's context (`owner`), not the
+   * service's own long-lived context — otherwise a reloaded plugin's provider
+   * lingers after the plugin is disposed and a re-registration throws
+   * DUPLICATE_PROVIDER while the stale provider (with a dead ctx) still answers
+   * inspect. Defaulting to the service ctx keeps backwards compatibility for
+   * callers that do not pass an owner.
+   *
    * @param provider - Named provider implementation.
+   * @param owner - Context the registration should be tied to (the registering plugin).
    * @returns A disposer for early removal.
    */
-  registerProvider(provider: MultimodalProvider): () => void {
+  registerProvider(provider: MultimodalProvider, owner?: Context): () => void {
     if (provider.id.length === 0) throw new MultimodalError('provider id must not be empty', 'INVALID_PROVIDER')
     if (this.providers.has(provider.id)) {
       throw new MultimodalError(`multimodal provider "${provider.id}" is already registered`, 'DUPLICATE_PROVIDER')
     }
     const providers = this.providers
-    const dispose = this.ctx.effect(function* () {
+    const scope = owner ?? this.ctx
+    const dispose = scope.effect(function* () {
       providers.set(provider.id, provider)
       yield () => providers.delete(provider.id)
     }, 'multimodal.registerProvider()')

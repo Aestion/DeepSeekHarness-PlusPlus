@@ -10,6 +10,7 @@ import { existsSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { CdpSession, createTarget, evaluate, fetchJson, listTargets, navigate } from './cdp.js'
+import { PAGE_SNAPSHOT_SCRIPT } from './snapshot.js'
 
 export const CDP_PORT = 18767
 
@@ -128,38 +129,12 @@ export class ManagedChrome {
     return CdpSession.connect(page.webSocketDebuggerUrl)
   }
 
-  /** Run a browser action against a freshly opened session (stateless per call). */
-  async withPage<T>(url: string, action: (session: CdpSession) => Promise<T>): Promise<T> {
-    const session = await this.openPage(url)
-    try {
-      return await action(session)
-    } finally {
-      session.close()
-    }
-  }
-
   async observe(): Promise<Record<string, unknown>> {
     const session = await this.ensurePage()
     try {
       const snapshot = (await evaluate(
         session,
-        `(() => {
-          const elements = [...document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"],[onclick]')]
-            .slice(0, 200)
-            .map((el, index) => ({
-              index,
-              tag: el.tagName.toLowerCase(),
-              text: (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim().slice(0, 80),
-              href: el.tagName === 'A' && el.href ? el.href.slice(0, 200) : null,
-              type: el.getAttribute('type'),
-            }));
-          return {
-            title: document.title,
-            url: location.href,
-            text: (document.body ? document.body.innerText : '').slice(0, 20000),
-            elements,
-          };
-        })()`,
+        PAGE_SNAPSHOT_SCRIPT,
       )) as Record<string, unknown>
       const screenshot = await this.captureScreenshot(session)
       return { ...snapshot, screenshot }
@@ -175,9 +150,23 @@ export class ManagedChrome {
       const name = `shot-${Date.now()}.png`
       const { writeFile } = await import('node:fs/promises')
       await writeFile(join(this.screenshotsDir, name), Buffer.from(data, 'base64'))
+      await this.pruneScreenshots()
       return join(this.screenshotsDir, name)
     } catch {
       return null
+    }
+  }
+
+  /** Keep only the most recent screenshots, deleting older ones so disk usage stays bounded. */
+  private async pruneScreenshots(): Promise<void> {
+    const MAX = 20
+    try {
+      const { readdir, unlink } = await import('node:fs/promises')
+      const files = (await readdir(this.screenshotsDir)).filter((file) => /^shot-.*\.png$/.test(file))
+      const stale = files.sort().reverse().slice(MAX)
+      await Promise.all(stale.map((file) => unlink(join(this.screenshotsDir, file))))
+    } catch {
+      // 清理失败不影响截图主流程。
     }
   }
 

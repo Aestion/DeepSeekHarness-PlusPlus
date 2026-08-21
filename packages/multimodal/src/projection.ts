@@ -11,7 +11,19 @@ function oneLine(value: string): string {
 }
 
 function untrustedText(value: string): string {
-  return value.replaceAll('[/DSH++ Multimodal Observation]', '[/DSH++ Multimodal Observation escaped]')
+  return value
+    .replaceAll('[/DSH++ Multimodal Observation]', '[/DSH++ Multimodal Observation escaped]')
+    .replaceAll('[DSH++ Multimodal Observation', '[DSH++ Multimodal Observation escaped')
+}
+
+/** Truncate to a UTF-16 budget without splitting a surrogate pair. */
+function safeSlice(value: string, limit: number): string {
+  if (value.length <= limit) return value
+  let end = limit
+  const last = value.charCodeAt(end - 1)
+  // 高代理（0xD800–0xDBFF）左移一位，避免留下孤立的代理项导致末尾 �。
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1
+  return value.slice(0, end)
 }
 
 /**
@@ -45,7 +57,7 @@ export function formatObservationProjection(
   const body = raw.length <= available
     ? raw
     : available > 1
-      ? `${raw.slice(0, available - 1)}…`
+      ? `${safeSlice(raw, available - 1)}…`
       : ''
   return `${prefix}\n${body}${suffix}`
 }

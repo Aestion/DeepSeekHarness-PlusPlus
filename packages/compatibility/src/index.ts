@@ -96,6 +96,9 @@ export function runDoctor(manifest: CompatibilityManifest, dshRoot?: string): Do
       : 'Install Node 22.19+ or 24+ for development; the portable product will carry its own runtime.',
   })
   if (dshRoot !== undefined) {
+    // 版本与 commit 各自独立守卫：git 读取失败（git 缺失 / 非 git 仓库）时，
+    // 先把已成功的版本检查保留，再把提交失败细节落到独立的 `dsh-source-commit`
+    // 检查里，而不是用一个笼统的 `dsh-source` 把两者一起吞掉（M8）。
     try {
       const packageJson = readJson(join(dshRoot, 'package.json'))
       const actualVersion = typeof packageJson.version === 'string' ? packageJson.version : 'missing'
@@ -108,6 +111,16 @@ export function runDoctor(manifest: CompatibilityManifest, dshRoot?: string): Do
           ? 'DSH source version matches the pinned baseline.'
           : 'DSH source version differs; update the compatibility manifest only after regression tests pass.',
       })
+    } catch (error: unknown) {
+      checks.push({
+        id: 'dsh-source',
+        ok: false,
+        expected: 'readable DSH repository package.json',
+        actual: error instanceof Error ? error.message : String(error),
+        message: 'The supplied DSH root could not be inspected for its source version.',
+      })
+    }
+    try {
       const actualCommit = gitHead(dshRoot)
       checks.push({
         id: 'dsh-source-commit',
@@ -120,11 +133,11 @@ export function runDoctor(manifest: CompatibilityManifest, dshRoot?: string): Do
       })
     } catch (error: unknown) {
       checks.push({
-        id: 'dsh-source',
+        id: 'dsh-source-commit',
         ok: false,
-        expected: 'readable DSH repository',
+        expected: manifest.deepseekHarness.commit,
         actual: error instanceof Error ? error.message : String(error),
-        message: 'The supplied DSH root could not be inspected.',
+        message: 'The DSH root git HEAD could not be read; the pinned commit cannot be verified.',
       })
     }
   }

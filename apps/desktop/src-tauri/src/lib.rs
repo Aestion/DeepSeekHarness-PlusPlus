@@ -238,6 +238,10 @@ impl ManagedChild {
             unsafe {
                 windows_sys::Win32::Foundation::CloseHandle(handle as _);
             }
+        } else if let Some(child) = self.child.as_ref() {
+            // Job Object 赋值失败（常见于父进程本身已在 job 内，Windows 8+ 嵌套行为）：
+            // KILL_ON_JOB_CLOSE 不可用，只能靠 taskkill /T 补齐整棵进程树。
+            kill_process_tree(child.id());
         }
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
@@ -527,13 +531,13 @@ fn discover_runtime() -> Result<RuntimePaths, String> {
 
     let project = find_project_root(&exe_dir)
         .or_else(|| find_project_root(Path::new(env!("CARGO_MANIFEST_DIR"))));
+    // Windows 上 Node 的标准安装位置（默认安装路径，非机器特有）。
     let project_node = PathBuf::from(r"C:\Program Files\nodejs\node.exe");
     let project_dsh = project
         .as_ref()
         .map(|root| root.join("runtime/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js"));
-    let project_mca = project.as_ref().map(|_| {
-        PathBuf::from(r"E:\MCA — Multi-Modal Content Adapter\build\sidecar\mca-runtime.exe")
-    });
+    // 开发模式下的 MCA 一律通过 DSHPLUSPLUS_MCA 环境变量或数据目录的可写副本 /
+    // 相邻运行时发现，不内置机器特有的绝对路径。
     let project_browser = project
         .as_ref()
         .map(|root| root.join("packages/browser-gateway/lib/index.js"));
@@ -581,7 +585,6 @@ fn discover_runtime() -> Result<RuntimePaths, String> {
                 .map(PathBuf::from)
                 .filter(|path| path.is_file())
                 .or_else(|| sibling_mca.is_file().then_some(sibling_mca))
-                .or_else(|| project_mca.filter(|path| path.is_file()))
         }
     };
     let browser_gateway = std::env::var_os("DSHPLUSPLUS_BROWSER")
@@ -838,27 +841,34 @@ fn config_path(runtime: &RuntimePaths) -> PathBuf {
 }
 
 fn load_config(runtime: &RuntimePaths) -> StoredConfig {
-    let mut config: StoredConfig = fs::read_to_string(config_path(runtime))
+    let config: StoredConfig = fs::read_to_string(config_path(runtime))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
-    // 电脑能力属于开箱即用范围：历史配置保存的 false 一律归一化为 true，
-    // 避免旧配置落进“开关禁用 ↔ Provider 未启用”的死锁。
-    config.mca_computer_observe = true;
-    config.mca_computer_act = true;
+    // mca_computer_observe/act 的默认值已在 StoredConfig::default() 里设为 true，
+    // 因此老配置（无这两个字段）仍按"开箱即用"得到 true；用户显式保存的 false 则
+    // 被 serde 读入并尊重，不再被这里强行覆盖。
     config
 }
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static WRITE_ATOMIC_SEQ: AtomicU32 = AtomicU32::new(0);
 
 fn write_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let temp = path.with_extension("tmp");
+    // 唯一临时名：pid + 递增序号，避免并发写同一文件时互相覆盖临时文件。
+    let seq = WRITE_ATOMIC_SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_extension(format!("tmp-{}-{seq}", std::process::id()));
     fs::write(&temp, content).map_err(|error| error.to_string())?;
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| error.to_string())?;
-    }
-    fs::rename(temp, path).map_err(|error| error.to_string())
+    // fs::rename 在 Windows 上也是原子替换（MoveFileExW + MOVEFILE_REPLACE_EXISTING），
+    // 因此无需先 remove_file——那一步会在 rename 前留下"目标不存在"的窗口。
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        error.to_string()
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -936,13 +946,15 @@ fn unprotect_secret(encoded: &str) -> Result<String, String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn protect_secret(secret: &str) -> Result<String, String> {
-    Ok(BASE64.encode(secret))
+fn protect_secret(_secret: &str) -> Result<String, String> {
+    // 该桌面应用实际只在 Windows 上运行（DPAPI 加密 + Job Object + reg.exe）。
+    // 非 Windows 没有可用的平台密钥存储，若强行 base64 落盘会变成"明文等价"，
+    // 这里显式拒绝，避免误导成已加密。
+    Err("密钥加密仅在 Windows 上支持".into())
 }
 #[cfg(not(target_os = "windows"))]
-fn unprotect_secret(encoded: &str) -> Result<String, String> {
-    String::from_utf8(BASE64.decode(encoded).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+fn unprotect_secret(_encoded: &str) -> Result<String, String> {
+    Err("密钥解密仅在 Windows 上支持".into())
 }
 
 fn validate_url(value: &str, field: &str, allow_empty: bool) -> Result<(), String> {
@@ -962,8 +974,9 @@ fn validate_config(input: &ConfigInput) -> Result<(), String> {
     if input.dsh_host != "127.0.0.1" && input.dsh_host != "localhost" {
         return Err("DSH 监听地址只能是 127.0.0.1 或 localhost".into());
     }
+    // dsh_port 是 u16，天然 ≤ 65535，此处只需拦下限（1024 以下为保留端口）。
     if input.dsh_port < 1024 {
-        return Err("DSH 端口必须不小于 1024".into());
+        return Err("DSH 端口必须在 1024–65535 之间".into());
     }
     if input.deepseek_model.is_empty() {
         return Err("DeepSeek 模型不能为空".into());
@@ -1689,6 +1702,17 @@ fn hide_console(command: &mut Command) {
 }
 #[cfg(not(target_os = "windows"))]
 fn hide_console(_: &mut Command) {}
+
+/// Windows 上强制结束某个进程的整棵进程树（`taskkill /T`），作为 Job Object
+/// 赋值失败时的兜底。进程已退出则忽略（返回成功）。
+#[cfg(target_os = "windows")]
+fn kill_process_tree(pid: u32) {
+    let pid_str = pid.to_string();
+    let mut command = Command::new("taskkill");
+    command.args(["/PID", pid_str.as_str(), "/T", "/F"]);
+    hide_console(&mut command);
+    let _ = command.status();
+}
 
 #[cfg(target_os = "windows")]
 fn assign_kill_on_close_job(child: &Child) -> Option<isize> {
@@ -2508,15 +2532,24 @@ fn check_for_update(app: tauri::AppHandle) -> Result<UpdateCheckResult, String> 
         if app_available && !artifact.url.is_empty() {
             match http_get_bytes(&artifact.url) {
                 Ok(bytes) => {
-                    write_atomic(&staged, &bytes)
-                        .map_err(|error| format!("暂存更新失败：{error}"))?;
-                    components.push(ComponentUpdate {
-                        name: "app".into(),
-                        current: Some(VERSION.into()),
-                        latest: Some(artifact.version.clone()),
-                        available: true,
-                        note: "已下载到 DSHPlusPlus.update.exe；退出后运行“更新到新版.cmd”即可生效".into(),
-                    });
+                    // 暂存失败（如装在 Program Files 无写权限）不中断整个检查，
+                    // 只把 app 组件标为不可更新并附上原因，其余组件状态保留。
+                    match write_atomic(&staged, &bytes) {
+                        Ok(()) => components.push(ComponentUpdate {
+                            name: "app".into(),
+                            current: Some(VERSION.into()),
+                            latest: Some(artifact.version.clone()),
+                            available: true,
+                            note: "已下载到 DSHPlusPlus.update.exe；退出后运行“更新到新版.cmd”即可生效".into(),
+                        }),
+                        Err(error) => components.push(ComponentUpdate {
+                            name: "app".into(),
+                            current: Some(VERSION.into()),
+                            latest: Some(artifact.version.clone()),
+                            available: false,
+                            note: format!("更新暂存失败：{error}"),
+                        }),
+                    }
                 }
                 Err(error) => components.push(ComponentUpdate {
                     name: "app".into(),
@@ -3200,6 +3233,11 @@ fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
         .stderr(Stdio::from(stderr));
     if let Some(secret) = config.vision_secret.as_deref() {
         command.env("DSHPLUSPLUS_VISION_API_KEY", unprotect_secret(secret)?);
+    }
+    // settings.yaml 里 apiKeyEnv 引用了 DEEPSEEK_API_KEY；把用户存的 DeepSeek key
+    // 解出并注入子进程环境，否则填了 key 也无法通过 DeepSeek 认证。
+    if let Some(secret) = config.deepseek_secret.as_deref() {
+        command.env("DEEPSEEK_API_KEY", unprotect_secret(secret)?);
     }
     hide_console(&mut command);
     let child = command
@@ -4411,7 +4449,7 @@ mod tests {
     #[test]
     fn materialize_preserves_existing_primary_config() {
         let (_tmp, runtime, home) = materialize_env("mat-existing");
-        let mut config = StoredConfig::default();
+        let config = StoredConfig::default();
         // 用户显式配置过 llm-deepseek（自定义 baseURL 与模型）
         write(
             &home.join("settings.yaml"),
@@ -4452,11 +4490,10 @@ llm-deepseek:
         assert!(config.mca_computer_act, "操作电脑应默认开启");
     }
 
-    /// 历史配置中保存的 false 在加载时归一化为 true：
-    /// 避免旧配置落进“开关禁用 ↔ Provider 未启用”的死锁。
+    /// 用户显式保存的 false 必须被尊重，不能每次启动都被强行拉回 true。
     #[test]
-    fn load_config_forces_computer_capabilities_on() {
-        let tmp = TempDir::new("cfg-force-computer");
+    fn load_config_respects_saved_computer_capabilities() {
+        let tmp = TempDir::new("cfg-computer-caps");
         let runtime = RuntimePaths {
             portable: true,
             data_root: tmp.path().join("data"),
@@ -4472,8 +4509,8 @@ llm-deepseek:
             r#"{"dshPort":18760,"mcaComputerObserve":false,"mcaComputerAct":false}"#,
         );
         let config = load_config(&runtime);
-        assert!(config.mca_computer_observe, "加载后观察电脑应被强制开启");
-        assert!(config.mca_computer_act, "加载后操作电脑应被强制开启");
+        assert!(!config.mca_computer_observe, "用户保存的 false 应被尊重");
+        assert!(!config.mca_computer_act, "用户保存的 false 应被尊重");
     }
 
     /// MCA 使用 DSH++ 专属端口（18767，紧邻 BROWSER_PORT），并把
