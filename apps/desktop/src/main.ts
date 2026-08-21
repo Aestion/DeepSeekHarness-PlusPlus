@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
+import { createSingleFlightRefresh, pollingInterval } from './polling.js'
 import './style.css'
 
 type ServiceState = 'stopped' | 'starting' | 'running' | 'error'
@@ -552,12 +553,24 @@ function renderAll(data: AppSnapshot): void {
   renderStatus(data)
 }
 
-async function refresh(full = false): Promise<void> {
+const refresh = createSingleFlightRefresh(async (full = false): Promise<void> => {
   try {
     const data = await invoke<AppSnapshot>(full ? 'get_snapshot' : 'refresh_status')
     if (full || snapshot === null) renderAll(data)
     else { snapshot = data; renderStatus(data) }
   } catch (error) { toast(String(error), true) }
+})
+
+function nextPollingInterval(): number {
+  if (snapshot === null) return 1_500
+  return pollingInterval([snapshot.dshState, snapshot.mcaState, snapshot.browserState])
+}
+
+function scheduleStatusRefresh(): void {
+  window.setTimeout(async () => {
+    if (!busy) await refresh(false)
+    scheduleStatusRefresh()
+  }, nextPollingInterval())
 }
 
 async function perform(action: () => Promise<void>): Promise<void> {
@@ -737,5 +750,4 @@ byId('get-dsh').addEventListener('click', () => perform(async () => {
   await invoke('open_dsh_guide')
 }))
 
-void refresh(true)
-window.setInterval(() => { if (!busy) void refresh(false) }, 1500)
+void refresh(true).finally(scheduleStatusRefresh)

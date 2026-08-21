@@ -7,6 +7,7 @@ use std::io::Read;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -24,6 +25,52 @@ const MCA_PORT: u16 = 18767;
 const BROWSER_PORT: u16 = 18766;
 /// Label of the embedded DSH desktop window (WebView2, loads the DSH web UI).
 const DSH_WINDOW_LABEL: &str = "dsh";
+
+type StartupTask = (&'static str, Box<dyn FnOnce() + Send>);
+
+fn launch_independent_tasks(tasks: Vec<StartupTask>) -> Result<(), String> {
+    for (name, task) in tasks {
+        thread::Builder::new()
+            .name(format!("startup-{name}"))
+            .spawn(task)
+            .map_err(|error| format!("无法提交 {name} 启动任务：{error}"))?;
+    }
+    Ok(())
+}
+
+fn finish_dsh_startup(
+    open_window: Option<Box<dyn FnOnce() + Send>>,
+    migrate_sessions: Box<dyn FnOnce() + Send>,
+) -> Result<(), String> {
+    if let Some(open_window) = open_window {
+        open_window();
+    }
+    launch_independent_tasks(vec![("session-migration", migrate_sessions)])
+}
+
+fn auxiliary_start_delay() -> Duration {
+    Duration::from_secs(3)
+}
+
+#[derive(Default)]
+struct SingleFlightGate(AtomicBool);
+
+struct SingleFlightGuard<'a>(&'a AtomicBool);
+
+impl SingleFlightGate {
+    fn try_enter(&self) -> Option<SingleFlightGuard<'_>> {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| SingleFlightGuard(&self.0))
+    }
+}
+
+impl Drop for SingleFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -302,6 +349,8 @@ struct AppState {
     browser: Mutex<ManagedChild>,
     /// chromeUse 扩展安装状态扫描缓存（时间戳 + 结果，3 秒 TTL）。
     extension_status: Mutex<Option<(Instant, ChromeExtensionView)>>,
+    /// MCA Agent 探测会启动多个外部进程，同一时刻只允许一个探测任务。
+    mca_detecting: SingleFlightGate,
     runtime: RuntimePaths,
 }
 
@@ -851,11 +900,16 @@ fn load_config(runtime: &RuntimePaths) -> StoredConfig {
     config
 }
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
 static WRITE_ATOMIC_SEQ: AtomicU32 = AtomicU32::new(0);
 
 fn write_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
+    if path.is_file() {
+        if let Ok(existing) = fs::read(path) {
+            if existing == content {
+                return Ok(());
+            }
+        }
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
@@ -869,6 +923,25 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<(), String> {
         let _ = fs::remove_file(&temp);
         error.to_string()
     })
+}
+
+fn copy_file_if_changed(source: &Path, destination: &Path) -> Result<(), String> {
+    if destination.is_file() {
+        let source_size = fs::metadata(source).map(|value| value.len()).ok();
+        let destination_size = fs::metadata(destination).map(|value| value.len()).ok();
+        if source_size == destination_size {
+            if let (Ok(source_bytes), Ok(destination_bytes)) =
+                (fs::read(source), fs::read(destination))
+            {
+                if source_bytes == destination_bytes {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    fs::copy(source, destination)
+        .map(|_| ())
+        .map_err(|error| format!("无法复制 {}：{error}", path_string(source)))
 }
 
 #[cfg(target_os = "windows")]
@@ -1068,8 +1141,7 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), String> {
         if metadata.is_dir() {
             copy_directory(&from, &to)?;
         } else if metadata.is_file() {
-            fs::copy(&from, &to)
-                .map_err(|error| format!("无法复制 {}：{error}", path_string(&from)))?;
+            copy_file_if_changed(&from, &to)?;
         }
     }
     Ok(())
@@ -1861,7 +1933,7 @@ fn configure_mca_route(
     // 刷新 MCA 的 Agent 探测缓存：shim 可能刚刚生成（MCA 进程启动时已
     // 带上 agent-shims 的 PATH，但复用已运行的 MCA 时需要主动刷新）。
     // 探测较慢（逐个 Agent 启动子进程查版本），给它独立的更长超时；失败不阻塞。
-    {
+    if let Some(_detect_guard) = state.mca_detecting.try_enter() {
         let detect_agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(20)))
             .build()
@@ -3193,7 +3265,6 @@ fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
         eprintln!("[dshplusplus] 便携数据迁移失败（可忽略）：{error}");
     }
     let home = effective_dsh_home(&state.runtime);
-    materialize_dsh_config(&state.runtime, config, &home)?;
     let workspace = if config.workspace.is_empty() {
         state.runtime.data_root.clone()
     } else {
@@ -3278,20 +3349,43 @@ fn start_dsh(state: &AppState, config: &StoredConfig) -> Result<(), String> {
 
 fn snapshot(state: &AppState) -> Result<AppSnapshot, String> {
     let config = state.config.lock().map_err(|_| "配置状态锁已损坏")?.clone();
-    let mut dsh = state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?;
-    let mut mca = state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?;
-    let mut browser = state.browser.lock().map_err(|_| "浏览器状态锁已损坏")?;
-    dsh.refresh(&config.dsh_host, config.dsh_port);
-    mca.refresh("127.0.0.1", MCA_PORT);
-    browser.refresh("127.0.0.1", BROWSER_PORT);
+    let (
+        dsh_state,
+        dsh_pid,
+        dsh_message,
+        mca_state,
+        mca_pid,
+        mca_message,
+        browser_state,
+        browser_pid,
+        browser_message,
+    ) = {
+        let mut dsh = state.dsh.lock().map_err(|_| "DSH 状态锁已损坏")?;
+        let mut mca = state.mca.lock().map_err(|_| "MCA 状态锁已损坏")?;
+        let mut browser = state.browser.lock().map_err(|_| "浏览器状态锁已损坏")?;
+        dsh.refresh(&config.dsh_host, config.dsh_port);
+        mca.refresh("127.0.0.1", MCA_PORT);
+        browser.refresh("127.0.0.1", BROWSER_PORT);
+        (
+            dsh.state,
+            dsh.child.as_ref().map(Child::id),
+            dsh.message.clone(),
+            mca.state,
+            mca.child.as_ref().map(Child::id),
+            mca.message.clone(),
+            browser.state,
+            browser.child.as_ref().map(Child::id),
+            browser.message.clone(),
+        )
+    };
     // MCA 运行时读取 deepseek-tui 路由能力/健康（供 UI 动态化开关）。
-    let mca_route = if matches!(mca.state, ServiceState::Running) && config.enable_mca {
+    let mca_route = if matches!(mca_state, ServiceState::Running) && config.enable_mca {
         fetch_mca_route()
     } else {
         None
     };
     // MCA 工具级健康（能力卡片展示）。
-    let mca_providers = if matches!(mca.state, ServiceState::Running) && config.enable_mca {
+    let mca_providers = if matches!(mca_state, ServiceState::Running) && config.enable_mca {
         fetch_mca_providers()
     } else {
         Vec::new()
@@ -3308,28 +3402,28 @@ fn snapshot(state: &AppState) -> Result<AppSnapshot, String> {
             mca_binary: state.runtime.mca.as_deref().map(path_string),
             browser_gateway: state.runtime.browser_gateway.as_deref().map(path_string),
         },
-        dsh_state: dsh.state,
+        dsh_state,
         dsh_url: format!("http://{}:{}", config.dsh_host, config.dsh_port),
-        dsh_pid: dsh.child.as_ref().map(Child::id),
-        dsh_message: dsh.message.clone(),
-        mca_state: mca.state,
+        dsh_pid,
+        dsh_message,
+        mca_state,
         mca_url: config
             .enable_mca
             .then(|| format!("http://127.0.0.1:{MCA_PORT}")),
-        mca_pid: mca.child.as_ref().map(Child::id),
+        mca_pid,
         mca_message: if !config.enable_mca {
             "已在配置中关闭".into()
         } else {
-            mca.message.clone()
+            mca_message
         },
         mca_route,
         mca_providers,
-        browser_state: browser.state,
-        browser_pid: browser.child.as_ref().map(Child::id),
+        browser_state,
+        browser_pid,
         browser_message: if !config.enable_browser && !config.enable_chrome_use {
             "已在配置中关闭".into()
         } else {
-            browser.message.clone()
+            browser_message
         },
         chrome_extension: cached_extension_status(state),
     })
@@ -3465,34 +3559,99 @@ fn start_services(app: tauri::AppHandle) -> Result<AppSnapshot, String> {
             mca.message = "准备内容与浏览器能力".into();
         }
     }
-    let worker = app.clone();
-    let auto_open = config.auto_open_dsh_window;
-    thread::spawn(move || {
-        let state = worker.state::<AppState>();
-        if config.enable_mca {
-            let _ = start_mca(&state, &config);
+    if config.enable_browser || config.enable_chrome_use {
+        let mut browser = state.browser.lock().map_err(|_| "浏览器状态锁已损坏")?;
+        browser.refresh("127.0.0.1", BROWSER_PORT);
+        if !matches!(browser.state, ServiceState::Running | ServiceState::Starting) {
+            browser.state = ServiceState::Starting;
+            browser.message = "准备浏览器能力".into();
         }
-        if config.enable_browser || config.enable_chrome_use {
-            let _ = start_browser(&state, &config);
-        }
-        if let Err(error) = start_dsh(&state, &config) {
-            if let Ok(mut dsh) = state.dsh.lock() {
-                dsh.state = ServiceState::Error;
-                dsh.message = error;
-            }
-        } else {
-            // 旧会话的模型选择平移到 deepseek-plus（图片发送适配）。
-            migrate_sessions_to_plus(&config.dsh_host, config.dsh_port);
-            if auto_open {
-                let handle = worker.clone();
-                let window_handle = handle.clone();
-                let _ = handle.run_on_main_thread(move || {
-                    let _ = open_dsh_window(&window_handle);
-                });
-            }
-        }
-    });
+    }
+    launch_startup_workers(app.clone(), config.clone(), config.auto_open_dsh_window)?;
     snapshot(&state)
+}
+
+fn launch_startup_workers(
+    app: tauri::AppHandle,
+    config: StoredConfig,
+    auto_open: bool,
+) -> Result<(), String> {
+    let mut tasks: Vec<StartupTask> = Vec::new();
+
+    let dsh_app = app.clone();
+    let dsh_config = config.clone();
+    tasks.push((
+        "dsh",
+        Box::new(move || {
+            let state = dsh_app.state::<AppState>();
+            if let Err(error) = start_dsh(&state, &dsh_config) {
+                if let Ok(mut dsh) = state.dsh.lock() {
+                    dsh.state = ServiceState::Error;
+                    dsh.message = error;
+                }
+                return;
+            }
+
+            let open_window = auto_open.then(|| {
+                let dispatch_handle = dsh_app.clone();
+                Box::new(move || {
+                    let window_handle = dispatch_handle.clone();
+                    if let Err(error) = dispatch_handle.run_on_main_thread(move || {
+                        if let Err(error) = open_dsh_window(&window_handle) {
+                            eprintln!("[dshplusplus] 自动打开 DSH 窗口失败：{error}");
+                        }
+                    }) {
+                        eprintln!("[dshplusplus] 无法提交 DSH 窗口打开任务：{error}");
+                    }
+                }) as Box<dyn FnOnce() + Send>
+            });
+            let migration_host = dsh_config.dsh_host.clone();
+            let migration_port = dsh_config.dsh_port;
+            if let Err(error) = finish_dsh_startup(
+                open_window,
+                Box::new(move || migrate_sessions_to_plus(&migration_host, migration_port)),
+            ) {
+                eprintln!("[dshplusplus] 无法提交会话迁移任务：{error}");
+            }
+        }),
+    ));
+
+    if config.enable_mca {
+        let mca_app = app.clone();
+        let mca_config = config.clone();
+        tasks.push((
+            "mca",
+            Box::new(move || {
+                thread::sleep(auxiliary_start_delay());
+                let state = mca_app.state::<AppState>();
+                if let Err(error) = start_mca(&state, &mca_config) {
+                    if let Ok(mut mca) = state.mca.lock() {
+                        mca.state = ServiceState::Error;
+                        mca.message = error;
+                    }
+                }
+            }),
+        ));
+    }
+
+    if config.enable_browser || config.enable_chrome_use {
+        let browser_app = app;
+        tasks.push((
+            "browser",
+            Box::new(move || {
+                thread::sleep(auxiliary_start_delay());
+                let state = browser_app.state::<AppState>();
+                if let Err(error) = start_browser(&state, &config) {
+                    if let Ok(mut browser) = state.browser.lock() {
+                        browser.state = ServiceState::Error;
+                        browser.message = error;
+                    }
+                }
+            }),
+        ));
+    }
+
+    launch_independent_tasks(tasks)
 }
 
 #[tauri::command]
@@ -3880,6 +4039,7 @@ pub fn run() {
                 mca: Mutex::new(ManagedChild::stopped("等待启动")),
                 browser: Mutex::new(ManagedChild::stopped("等待启动")),
                 extension_status: Mutex::new(None),
+                mca_detecting: SingleFlightGate::default(),
                 runtime,
             });
 
@@ -3941,28 +4101,30 @@ pub fn run() {
 
             if should_start {
                 let handle = app.handle().clone();
-                thread::spawn(move || {
-                    let state = handle.state::<AppState>();
-                    let Ok(config) = state.config.lock().map(|value| value.clone()) else {
-                        return;
-                    };
-                    if config.enable_mca {
-                        let _ = start_mca(&state, &config);
+                let state = handle.state::<AppState>();
+                let Ok(config) = state.config.lock().map(|value| value.clone()) else {
+                    eprintln!("[dshplusplus] 配置状态锁已损坏，无法自动启动");
+                    return Ok(());
+                };
+                if let Ok(mut dsh) = state.dsh.lock() {
+                    dsh.state = ServiceState::Starting;
+                    dsh.message = "启动任务已提交".into();
+                }
+                if config.enable_mca {
+                    if let Ok(mut mca) = state.mca.lock() {
+                        mca.state = ServiceState::Starting;
+                        mca.message = "准备内容能力".into();
                     }
-                    if config.enable_browser || config.enable_chrome_use {
-                        let _ = start_browser(&state, &config);
+                }
+                if config.enable_browser || config.enable_chrome_use {
+                    if let Ok(mut browser) = state.browser.lock() {
+                        browser.state = ServiceState::Starting;
+                        browser.message = "准备浏览器能力".into();
                     }
-                    if start_dsh(&state, &config).is_ok() {
-                        // 旧会话的模型选择平移到 deepseek-plus（图片发送适配）。
-                        migrate_sessions_to_plus(&config.dsh_host, config.dsh_port);
-                        if auto_open {
-                            let window_handle = handle.clone();
-                            let _ = handle.run_on_main_thread(move || {
-                                let _ = open_dsh_window(&window_handle);
-                            });
-                        }
-                    }
-                });
+                }
+                if let Err(error) = launch_startup_workers(handle.clone(), config, auto_open) {
+                    eprintln!("[dshplusplus] 无法提交启动任务：{error}");
+                }
             }
             Ok(())
         })
@@ -4650,5 +4812,98 @@ llm-deepseek:
             "应解析到包本体 bin.js，实际：{}",
             cli.display()
         );
+    }
+
+    #[test]
+    fn independent_startup_tasks_do_not_block_each_other() {
+        use std::sync::mpsc;
+
+        let (slow_started_tx, slow_started_rx) = mpsc::channel();
+        let (release_slow_tx, release_slow_rx) = mpsc::channel();
+        let (dsh_ready_tx, dsh_ready_rx) = mpsc::channel();
+
+        launch_independent_tasks(vec![
+            (
+                "slow-auxiliary",
+                Box::new(move || {
+                    slow_started_tx.send(()).unwrap();
+                    release_slow_rx.recv().unwrap();
+                }) as Box<dyn FnOnce() + Send>,
+            ),
+            (
+                "dsh",
+                Box::new(move || {
+                    dsh_ready_tx.send(()).unwrap();
+                }),
+            ),
+        ])
+        .unwrap();
+
+        slow_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("慢辅助任务应已启动");
+        dsh_ready_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("DSH 任务不应等待慢辅助任务完成");
+        release_slow_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn dsh_ready_opens_before_background_migration() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        let open_submitted = Arc::new(AtomicBool::new(false));
+        let opened = open_submitted.clone();
+        let migrated = open_submitted.clone();
+        let (migration_tx, migration_rx) = mpsc::channel();
+
+        finish_dsh_startup(
+            Some(Box::new(move || {
+                opened.store(true, Ordering::SeqCst);
+            })),
+            Box::new(move || {
+                migration_tx
+                    .send(migrated.load(Ordering::SeqCst))
+                    .unwrap();
+            }),
+        )
+        .unwrap();
+
+        assert!(
+            migration_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "会话迁移启动前必须先提交页面打开"
+        );
+    }
+
+    #[test]
+    fn single_flight_gate_rejects_overlapping_work() {
+        let gate = SingleFlightGate::default();
+        let first = gate.try_enter().expect("第一次任务应取得门闩");
+        assert!(gate.try_enter().is_none(), "并发任务应被跳过");
+        drop(first);
+        assert!(gate.try_enter().is_some(), "任务结束后应允许再次执行");
+    }
+
+    #[test]
+    fn auxiliary_start_delay_prioritizes_dsh_without_long_wait() {
+        assert_eq!(auxiliary_start_delay(), Duration::from_secs(3));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn unchanged_files_are_not_rewritten() {
+        let tmp = TempDir::new("unchanged-write");
+        let source = tmp.path().join("source.txt");
+        let destination = tmp.path().join("destination.txt");
+        write(&source, "same content");
+        write(&destination, "same content");
+        let mut permissions = fs::metadata(&destination).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&destination, permissions).unwrap();
+
+        copy_file_if_changed(&source, &destination).expect("相同文件不应尝试覆盖只读目标");
+        write_atomic(&destination, b"same content").expect("相同配置不应尝试覆盖只读目标");
     }
 }
